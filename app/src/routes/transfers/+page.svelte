@@ -222,7 +222,7 @@
   }
 
   function alphaPerGwLabel(row: any) {
-    const alpha = row?.per_gw_alpha;
+    const alpha = row?.net_per_gw_alpha ?? row?.per_gw_alpha;
     if (typeof alpha !== 'number' || Number.isNaN(alpha)) return '—';
     return `${alpha >= 0 ? '+' : ''}${alpha.toFixed(2)}`;
   }
@@ -672,7 +672,7 @@
                     <td class="r mono">£{t.out_cost?.toFixed(1) ?? '—'}</td>
                     <td>{t.in_name}</td>
                     <td class="r mono">£{t.in_cost?.toFixed(1) ?? '—'}</td>
-                    <td class="r mono {scored?.per_gw_alpha > 0 ? 'positive' : scored?.per_gw_alpha < 0 ? 'negative' : ''}">
+                    <td class="r mono {scored?.net_per_gw_alpha > 0 ? 'positive' : scored?.net_per_gw_alpha < 0 ? 'negative' : ''}">
                       {alphaPerGwLabel(scored)}
                     </td>
                     <td>

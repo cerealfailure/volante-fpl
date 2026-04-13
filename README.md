@@ -59,14 +59,14 @@ It will:
 
 In the Transfers screen, the history panel now shows two checks for each move:
 
-- `Alpha/GW`: realized points gained or lost per remaining gameweek, which makes early and late-season transfers comparable
+- `Alpha/GW`: realized net points gained or lost per remaining gameweek after allocating that GW's hit cost across its transfers, which makes early and late-season moves comparable
 - `Matrix`: whether the move lifted ENB / reduced concentration (`Up`) or pushed the squad into a tighter stack (`Down`)
 
 That gives you a concrete way to test whether using the matrix is helping rather than relying on feel:
 
 - compare the `ENB Up` bucket vs the `ENB Down` bucket in the scorecard
 - inspect individual moves where the matrix said `Up` but the realized alpha was negative, or vice versa
-- keep using `Alpha/GW` rather than raw points when judging the process, because old transfers had more time to accumulate returns
+- keep using `Alpha/GW` rather than raw points when judging the process, because old transfers had more time to accumulate returns and some GWs included paid hits
 
 ## Notes
 
