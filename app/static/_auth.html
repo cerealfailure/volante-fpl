@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Volante Auth Helper</title>
+  </head>
+  <body>
+    <script>
+      const params = new URLSearchParams(window.location.search);
+      const manager = params.get('mgr') || '1';
+      const theme = params.get('theme') || 'clean';
+      const next = params.get('next') || '/';
+
+      localStorage.setItem('volante-mgr', manager);
+      localStorage.setItem('volante-theme', theme);
+      window.location.replace(next);
+    </script>
+  </body>
+</html>

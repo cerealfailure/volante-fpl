@@ -1,0 +1,957 @@
+/* ═══════════════════════════════════════════════════════════════════
+   PIXEL — Tecmo-era football arcade scoreboard.
+   Inspired by PICO-8, Playdate SDK, Teenage Engineering OP-1, NES dev tools.
+
+   Design discipline:
+   • Grid: every dimension is a multiple of 4px. No 7/9/11/13.
+   • Fonts: Press Start 2P at integer native sizes (8/16/24).
+     VT323 at 16/20. `font-smooth: never` everywhere.
+   • Palette: 8 named colors. No gradients. No scanline overlay (cliché).
+   • Chrome: inset highlight top-left + hard bezel bottom-right — panels
+     are physical objects. The shadow is structure, not decoration.
+   • Motion: discrete frames only. 2-step snap on hover (80ms), and
+     button press moves exactly 2px down + shadow disappears.
+   • Iconography: ASCII glyphs (▸ ▾ ▪ ░ ▒ ▓ █) where possible.
+   ═══════════════════════════════════════════════════════════════════ */
+
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=VT323&display=swap');
+
+[data-theme="pixel"] {
+  /* ── Named palette (8 colors max — PICO-8 discipline) ── */
+  --px-cream:   #ece2c9;   /* LCD panel */
+  --px-cream-2: #e0d5b8;   /* grain stripe */
+  --px-card:    #f6eedb;   /* elevated surface */
+  --px-card-2:  #fffaec;   /* inputs / highlight */
+  --px-ink:     #16162a;   /* outline + body text */
+  --px-ink-2:   #2b2b44;   /* secondary ink */
+  --px-red:     #e63946;   /* red-card accent */
+  --px-moss:    #2a8c2a;   /* positive */
+  --px-brass:   #f0c020;   /* yellow-card + highlight */
+  --px-sky:     #2a6fdb;   /* cool accent */
+
+  /* Map into the design-system tokens */
+  --bg:           var(--px-cream);
+  --bg-warm:      var(--px-cream-2);
+  --bg-elevated:  var(--px-card);
+  --bg-card:      var(--px-card);
+  --bg-card-hover: var(--px-card-2);
+  --bg-selected:  #ffeb99;
+  --bg-glass:     var(--px-cream);
+
+  --border:        var(--px-ink);
+  --border-hover:  #000000;
+  --border-accent: var(--px-red);
+  --border-glow:   var(--px-red);
+  --chalk:         var(--px-ink);
+
+  --text:           var(--px-ink);
+  --text-secondary: var(--px-ink-2);
+  --text-muted:     #58587a;
+  --text-heading:   #090918;
+
+  --accent:       var(--px-red);
+  --accent-soft:  #f2d4d7;
+  --accent-text:  #9a1828;
+  --accent-deep:  #6e0e1a;
+
+  --green:       var(--px-moss);
+  --green-soft:  #c9ead0;
+  --red:         var(--px-red);
+  --red-soft:    #f0c8cc;
+  --yellow:      var(--px-brass);
+  --yellow-soft: #f6e7a8;
+  --blue:        var(--px-sky);
+  --purple:      #6a3a9a;
+
+  /* Type — pixel fonts keyed to native integer sizes */
+  --font:    'VT323', monospace;
+  --mono:    'VT323', monospace;
+  --heading: 'Press Start 2P', monospace;
+
+  /* No corners */
+  --radius:    0px;
+  --radius-sm: 0px;
+  --radius-lg: 0px;
+  --radius-xl: 0px;
+
+  /* Physical shadow — the 4px-offset ink bezel */
+  --px-bezel:      4px 4px 0 0 var(--px-ink);
+  --px-bezel-sm:   2px 2px 0 0 var(--px-ink);
+  --px-bezel-red:  4px 4px 0 0 var(--px-red);
+  --px-bezel-brass:4px 4px 0 0 var(--px-brass);
+
+  --shadow-sm:   var(--px-bezel-sm);
+  --shadow-md:   var(--px-bezel);
+  --shadow-lg:   6px 6px 0 0 var(--px-ink);
+  --shadow-glow: 0 0 0 2px var(--px-red), var(--px-bezel);
+
+  /* Snap motion — no continuous tweens. Two-frame steps. */
+  --ease:     steps(2, end);
+  --duration: 80ms;
+  --duration-fast: 0ms;
+  --duration-lg: 120ms;
+
+  color: var(--px-ink);
+  image-rendering: pixelated;
+  font-smooth: never;
+  -webkit-font-smoothing: none;
+  -moz-osx-font-smoothing: unset;
+}
+
+/* LCD panel: tight alternating cream stripe. No gradient, no scanline. */
+[data-theme="pixel"] body {
+  background:
+    repeating-linear-gradient(
+      90deg,
+      var(--px-cream)    0 64px,
+      var(--px-cream-2) 64px 128px
+    );
+}
+
+/* Kill all cross-theme animations + radii. Keep our pixel snap motion. */
+[data-theme="pixel"] *,
+[data-theme="pixel"] *::before,
+[data-theme="pixel"] *::after {
+  border-radius: 0 !important;
+  font-smooth: never;
+  -webkit-font-smoothing: none !important;
+  image-rendering: pixelated;
+}
+
+/* ── Typography — Press Start 2P at 8/16, VT323 at 16/20 ────────── */
+[data-theme="pixel"] html,
+[data-theme="pixel"] body {
+  font-size: 16px;
+  line-height: 1.25;
+  font-family: var(--font);
+  letter-spacing: 0;
+}
+
+[data-theme="pixel"] h1 {
+  font-family: var(--heading);
+  font-size: 16px;          /* native 16 */
+  line-height: 1.75;
+  letter-spacing: 0;
+  color: var(--px-ink);
+  text-shadow: 3px 3px 0 var(--px-red);
+  margin-bottom: 4px;
+}
+[data-theme="pixel"] h1.display {
+  font-size: 24px;          /* native 24 */
+  line-height: 1.6;
+  text-shadow: 4px 4px 0 var(--px-red);
+}
+[data-theme="pixel"] h2 {
+  font-family: var(--heading);
+  font-size: 8px;           /* native 8 */
+  line-height: 2;
+  color: var(--px-ink);
+  text-transform: uppercase;
+}
+[data-theme="pixel"] h3 {
+  font-family: var(--heading);
+  font-size: 8px;
+  line-height: 2;
+  color: var(--px-red);
+  text-transform: uppercase;
+}
+
+/* Body — VT323 native 16/20 */
+[data-theme="pixel"] p,
+[data-theme="pixel"] span,
+[data-theme="pixel"] a,
+[data-theme="pixel"] td,
+[data-theme="pixel"] th,
+[data-theme="pixel"] li,
+[data-theme="pixel"] label,
+[data-theme="pixel"] .mono,
+[data-theme="pixel"] .small,
+[data-theme="pixel"] .dim,
+[data-theme="pixel"] .dim2 {
+  font-family: var(--font);
+  font-size: 16px;
+  line-height: 1.3;
+  letter-spacing: 0;
+}
+[data-theme="pixel"] .small,
+[data-theme="pixel"] .dim2 { font-size: 14px; }
+
+/* Stat values — scoreboard digits, brass drop */
+[data-theme="pixel"] .stat-value {
+  font-family: var(--heading);
+  font-size: 16px;
+  line-height: 1;
+  color: var(--px-ink);
+  text-shadow: 2px 2px 0 var(--px-brass);
+  letter-spacing: 0;
+}
+[data-theme="pixel"] .stat-label {
+  font-family: var(--heading);
+  font-size: 8px;
+  letter-spacing: 0;
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+/* ── Cards — physical panels with inset highlight + hard bezel ── */
+[data-theme="pixel"] .card {
+  border: 4px solid var(--px-ink);
+  box-shadow:
+    /* inset top-left highlight — simulates light hitting an object */
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    /* hard bezel drop bottom-right — physical weight */
+    var(--px-bezel);
+  background: var(--px-card);
+  position: relative;
+  padding: 16px;
+}
+[data-theme="pixel"] .card:hover {
+  background: var(--px-card-2);
+}
+[data-theme="pixel"] .card.active {
+  background: #fff3b0;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel-red);
+}
+/* Remove any clean-theme ::before accent stripe */
+[data-theme="pixel"] .card::before { display: none !important; }
+
+/* ── Buttons — physical keycaps with press-down feedback ───────── */
+[data-theme="pixel"] button,
+[data-theme="pixel"] .btn-primary,
+[data-theme="pixel"] .btn-ghost {
+  font-family: var(--heading);
+  font-size: 8px;
+  padding: 12px 16px;
+  border: 4px solid var(--px-ink);
+  background: var(--px-card);
+  color: var(--px-ink);
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.6),
+    var(--px-bezel);
+  letter-spacing: 0;
+  text-transform: uppercase;
+  transition: transform var(--duration) var(--ease),
+              box-shadow var(--duration) var(--ease),
+              background var(--duration) var(--ease);
+}
+[data-theme="pixel"] button:hover {
+  background: var(--px-brass);
+  color: var(--px-ink);
+}
+[data-theme="pixel"] button:active {
+  transform: translate(2px, 2px);
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.3),
+    2px 2px 0 0 var(--px-ink);
+}
+[data-theme="pixel"] .btn-primary {
+  background: var(--px-red);
+  color: var(--px-cream);
+}
+[data-theme="pixel"] .btn-primary:hover {
+  background: var(--px-ink);
+  color: var(--px-cream);
+}
+[data-theme="pixel"] .btn-ghost { background: var(--px-card); }
+
+/* ── Inputs — recessed LCD panel ──────────────────────────────── */
+[data-theme="pixel"] input {
+  font-family: var(--font);
+  font-size: 16px;
+  border: 4px solid var(--px-ink);
+  background: var(--px-card-2);
+  color: var(--px-ink);
+  padding: 8px 12px;
+  box-shadow:
+    /* inverse: dark top-left, light bottom-right = recessed */
+    inset 3px 3px 0 0 rgba(22, 22, 42, 0.22),
+    inset -1px -1px 0 0 rgba(255, 255, 255, 0.6);
+}
+[data-theme="pixel"] input:focus {
+  outline: none;
+  border-color: var(--px-red);
+  box-shadow:
+    inset 3px 3px 0 0 rgba(230, 57, 70, 0.22),
+    inset -1px -1px 0 0 rgba(255, 255, 255, 0.6),
+    0 0 0 2px var(--px-red);
+}
+
+/* Double-ring focus override — the base.css double-ring doesn't fit pixel.
+   Pixel gets a hard 4px outline instead. */
+[data-theme="pixel"] button:focus-visible,
+[data-theme="pixel"] a:focus-visible,
+[data-theme="pixel"] input:focus-visible,
+[data-theme="pixel"] [tabindex]:focus-visible {
+  outline: 4px solid var(--px-red);
+  outline-offset: 0;
+  box-shadow: none;
+}
+
+/* ── Tables — dense data grids ────────────────────────────────── */
+[data-theme="pixel"] table {
+  border-collapse: separate;
+  border-spacing: 0;
+  border: 4px solid var(--px-ink);
+  background: var(--px-card);
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel);
+}
+[data-theme="pixel"] th {
+  background: var(--px-ink);
+  color: var(--px-cream);
+  font-family: var(--heading);
+  font-size: 8px;
+  border-bottom: 4px solid var(--px-ink);
+  padding: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0;
+}
+[data-theme="pixel"] td {
+  border-bottom: 2px solid var(--px-cream-2);
+  padding: 8px;
+  font-size: 16px;
+}
+[data-theme="pixel"] tr:hover td { background: #fff3b0; }
+
+/* ── Nav — pixel menu cells ───────────────────────────────────── */
+[data-theme="pixel"] .header-nav {
+  border: 4px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.5),
+    var(--px-bezel-sm);
+  padding: 0 !important;
+  gap: 0 !important;
+}
+[data-theme="pixel"] .nav-link {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  padding: 10px 14px !important;
+  border: 0 !important;
+  color: var(--px-ink) !important;
+  background: transparent !important;
+  text-transform: uppercase;
+  letter-spacing: 0 !important;
+  position: relative;
+}
+[data-theme="pixel"] .nav-link + .nav-link {
+  border-left: 2px solid var(--px-ink) !important;
+}
+[data-theme="pixel"] .nav-link:hover {
+  background: var(--px-brass) !important;
+  color: var(--px-ink) !important;
+  transform: none !important;
+}
+[data-theme="pixel"] .nav-link.active {
+  background: var(--px-red) !important;
+  color: var(--px-cream) !important;
+  box-shadow: inset 0 -3px 0 0 var(--px-ink) !important;
+}
+/* Menu-cursor glyph — ▸ before active item (ASCII iconography) */
+[data-theme="pixel"] .nav-link.active::before {
+  content: '▸ ';
+  font-family: var(--font);
+  font-size: 14px;
+  margin-right: 2px;
+}
+
+/* Header shell */
+[data-theme="pixel"] header {
+  background: var(--px-cream) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border-bottom: 4px solid var(--px-ink) !important;
+}
+[data-theme="pixel"] .header-pitch-line {
+  height: 4px !important;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--px-ink) 0 8px,
+    var(--px-red) 8px 16px
+  ) !important;
+  opacity: 1 !important;
+}
+
+/* Brand */
+[data-theme="pixel"] .brand-mark-img {
+  border: 3px solid var(--px-ink);
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+  image-rendering: pixelated;
+  width: 32px !important;
+  height: 32px !important;
+}
+[data-theme="pixel"] .brand-name {
+  font-family: var(--heading) !important;
+  font-size: 10px !important;
+  letter-spacing: 0 !important;
+  color: var(--px-ink) !important;
+}
+[data-theme="pixel"] .brand-tag {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+  color: var(--px-ink-2) !important;
+  letter-spacing: 0 !important;
+}
+[data-theme="pixel"] .id-chip {
+  border: 3px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  font-family: var(--heading) !important;
+  font-size: 7px !important;
+  padding: 8px 10px !important;
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+}
+
+/* Mobile nav */
+[data-theme="pixel"] .mobile-nav {
+  background: var(--px-cream) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border-top: 4px solid var(--px-ink) !important;
+}
+[data-theme="pixel"] .mobile-link {
+  border: 2px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+  color: var(--px-ink) !important;
+}
+[data-theme="pixel"] .mobile-link.active {
+  background: var(--px-red) !important;
+  color: var(--px-cream) !important;
+}
+
+/* ── Badges ──────────────────────────────────────────────────── */
+[data-theme="pixel"] .badge {
+  font-family: var(--heading);
+  font-size: 6px;
+  padding: 4px 8px;
+  border: 2px solid var(--px-ink);
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+
+/* ── Risk severity + cards ───────────────────────────────────── */
+[data-theme="pixel"] .risk-card {
+  border: 4px solid var(--px-ink);
+  border-left: 8px solid;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel);
+  background: var(--px-card-2);
+}
+
+/* ── FDR — flat color cells, no tint ─────────────────────────── */
+[data-theme="pixel"] .fdr-1 { background: var(--px-moss);  color: var(--px-cream) !important; }
+[data-theme="pixel"] .fdr-2 { background: #6aba4a;         color: var(--px-ink) !important; }
+[data-theme="pixel"] .fdr-3 { background: var(--px-cream); color: var(--text-secondary) !important; }
+[data-theme="pixel"] .fdr-4 { background: var(--px-brass); color: var(--px-ink) !important; }
+[data-theme="pixel"] .fdr-5 { background: var(--px-red);   color: var(--px-cream) !important; }
+
+/* ── Correlation matrix ──────────────────────────────────────── */
+[data-theme="pixel"] .corr-cell { border: 1px solid var(--px-ink) !important; }
+[data-theme="pixel"] .cell-val {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+}
+
+/* ── Exposure bars — ▓ dither pattern fill ───────────────────── */
+[data-theme="pixel"] .bar-track {
+  border: 2px solid var(--px-ink);
+  background: var(--px-cream) !important;
+  height: 16px !important;
+  box-shadow: inset 2px 2px 0 0 rgba(22, 22, 42, 0.2);
+}
+[data-theme="pixel"] .bar-fill {
+  background: repeating-linear-gradient(
+    135deg,
+    var(--px-ink)   0 4px,
+    var(--px-ink-2) 4px 8px
+  ) !important;
+  opacity: 1 !important;
+}
+
+/* ── Sign-in rule (inherited from clean) — pixel bar ─────────── */
+[data-theme="pixel"] .signin-rule {
+  width: 96px !important;
+  height: 4px !important;
+  background: repeating-linear-gradient(
+    90deg,
+    var(--px-ink) 0 8px,
+    var(--px-red) 8px 16px
+  ) !important;
+}
+
+/* ── Semantic color keeps ────────────────────────────────────── */
+[data-theme="pixel"] .positive { color: var(--px-moss) !important; }
+[data-theme="pixel"] .negative { color: var(--px-red) !important; }
+[data-theme="pixel"] .accent   { color: var(--px-red) !important; }
+
+/* ── Scrollbars — chunky pixel rail ──────────────────────────── */
+[data-theme="pixel"] ::-webkit-scrollbar { width: 16px; height: 16px; }
+[data-theme="pixel"] ::-webkit-scrollbar-track {
+  background: var(--px-cream-2);
+  border-left: 2px solid var(--px-ink);
+}
+[data-theme="pixel"] ::-webkit-scrollbar-thumb {
+  background: var(--px-ink);
+  border: 2px solid var(--px-cream-2);
+}
+[data-theme="pixel"] ::-webkit-scrollbar-thumb:hover { background: var(--px-red); }
+
+/* ── Selection ───────────────────────────────────────────────── */
+[data-theme="pixel"] ::selection { background: var(--px-red); color: var(--px-cream); }
+
+/* ── Eyebrow — pixel menu label ──────────────────────────────── */
+[data-theme="pixel"] .eyebrow {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+  color: var(--px-red) !important;
+  letter-spacing: 0 !important;
+  text-transform: uppercase;
+}
+
+/* ── Chalk / hairline → pixel dash ───────────────────────────── */
+[data-theme="pixel"] .chalk-line,
+[data-theme="pixel"] .hairline {
+  background: repeating-linear-gradient(90deg, var(--px-ink) 0 8px, transparent 8px 16px) !important;
+  opacity: 1 !important;
+  height: 2px !important;
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   COMPONENT OVERRIDES — home page + shared components
+   ═══════════════════════════════════════════════════════════════ */
+
+/* Desk notes */
+[data-theme="pixel"] .desk-head h2 {
+  font-size: 10px !important;
+  line-height: 2 !important;
+  text-shadow: 2px 2px 0 var(--px-red);
+  max-width: none !important;
+}
+[data-theme="pixel"] .desk-head p {
+  font-family: var(--font) !important;
+  font-size: 16px !important;
+  line-height: 1.35 !important;
+}
+[data-theme="pixel"] .desk-help {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+  border: 3px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  padding: 8px 10px !important;
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+}
+
+/* Sign-in screen */
+[data-theme="pixel"] .signin h1 {
+  font-size: 16px !important;
+  line-height: 1.75 !important;
+  letter-spacing: 0 !important;
+  text-shadow: 3px 3px 0 var(--px-red);
+}
+[data-theme="pixel"] .signin h1.display {
+  font-size: 24px !important;
+  line-height: 1.55 !important;
+  text-shadow: 4px 4px 0 var(--px-red);
+}
+[data-theme="pixel"] .signin-sub,
+[data-theme="pixel"] .signin-hint,
+[data-theme="pixel"] .help-link {
+  font-family: var(--font) !important;
+  font-size: 16px !important;
+}
+[data-theme="pixel"] .label-text {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+}
+[data-theme="pixel"] .recent-managers {
+  border: 4px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel);
+}
+[data-theme="pixel"] .recent-chip {
+  border: 3px solid var(--px-ink) !important;
+  background: var(--px-card-2) !important;
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+}
+[data-theme="pixel"] .recent-chip:hover {
+  background: var(--px-brass) !important;
+}
+[data-theme="pixel"] .rc-name {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  text-shadow: 2px 2px 0 var(--px-brass);
+}
+[data-theme="pixel"] .rc-sub {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+}
+[data-theme="pixel"] .signin-crest .crest {
+  border: 4px solid var(--px-ink) !important;
+  box-shadow: var(--px-bezel) !important;
+  image-rendering: pixelated;
+}
+[data-theme="pixel"] .feat strong {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+}
+[data-theme="pixel"] .feat span {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+}
+
+/* Manager header (squad screen) */
+[data-theme="pixel"] .mgr-identity h1 {
+  font-size: 16px !important;
+  line-height: 1.75 !important;
+  text-shadow: 3px 3px 0 var(--px-red) !important;
+  max-width: none !important;
+}
+[data-theme="pixel"] .mgr-identity h1.display {
+  font-size: 24px !important;
+  line-height: 1.55 !important;
+  text-shadow: 4px 4px 0 var(--px-red) !important;
+}
+[data-theme="pixel"] .mgr-name {
+  font-family: var(--font) !important;
+  font-size: 16px !important;
+}
+[data-theme="pixel"] .scoreboard {
+  border: 4px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel) !important;
+}
+[data-theme="pixel"] .scoreboard::before { display: none !important; }
+[data-theme="pixel"] .sb-cell + .sb-cell::before {
+  background: var(--px-ink) !important;
+  width: 2px !important;
+}
+[data-theme="pixel"] .sb-val {
+  font-family: var(--heading) !important;
+  font-size: 12px !important;
+  text-shadow: 2px 2px 0 var(--px-brass);
+}
+[data-theme="pixel"] .sb-label {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+}
+
+/* Health-bar — a single chunky scoreboard, not a chip row */
+[data-theme="pixel"] .health-bar {
+  border: 4px solid var(--px-ink) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel) !important;
+  background: var(--px-card) !important;
+  padding: 12px !important;
+  gap: 0 !important;
+  grid-template-columns: repeat(auto-fit, minmax(148px, 1fr)) !important;
+}
+[data-theme="pixel"] .hb-stat {
+  border: 0 !important;
+  border-right: 2px solid var(--px-ink) !important;
+  background: transparent !important;
+  padding: 8px 12px !important;
+  transform: none !important;
+}
+[data-theme="pixel"] .hb-stat:last-child { border-right: 0 !important; }
+[data-theme="pixel"] .hb-stat:hover {
+  background: #fff3b0 !important;
+  border-color: var(--px-ink) !important;
+}
+[data-theme="pixel"] .hb-stat .mono {
+  font-family: var(--heading) !important;
+  font-size: 10px !important;
+  text-shadow: 1px 1px 0 var(--px-brass);
+}
+[data-theme="pixel"] .hb-ep .mono {
+  font-size: 12px !important;
+}
+
+/* Analysis tabs — menu buttons */
+[data-theme="pixel"] .atab {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  border: 4px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel-sm) !important;
+  padding: 12px 16px !important;
+  margin-right: 8px !important;
+  text-transform: uppercase;
+}
+[data-theme="pixel"] .atab:hover {
+  background: var(--px-brass) !important;
+  border-color: var(--px-ink) !important;
+}
+[data-theme="pixel"] .atab.active {
+  background: var(--px-red) !important;
+  color: var(--px-cream) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.3),
+    var(--px-bezel-sm) !important;
+}
+[data-theme="pixel"] .atab.active::after { display: none !important; }
+[data-theme="pixel"] .atab.active::before {
+  content: '▸ ';
+  font-family: var(--font);
+  font-size: 14px;
+  margin-right: 2px;
+}
+
+/* Player-chip tooltips — chunky scoreboard */
+[data-theme="pixel"] .tip {
+  background: var(--px-card) !important;
+  border: 4px solid var(--px-ink) !important;
+  box-shadow: var(--px-bezel) !important;
+}
+[data-theme="pixel"] .tt span {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+}
+
+/* Meta footer */
+[data-theme="pixel"] .meta-footer {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+  border-top: 4px solid var(--px-ink) !important;
+}
+
+/* Risk bars + fixture detail */
+[data-theme="pixel"] .risk-bars { gap: 8px !important; padding: 8px 0; }
+[data-theme="pixel"] .rb-row {
+  background: var(--px-card-2);
+  border: 3px solid var(--px-ink);
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+  padding: 8px 12px;
+  gap: 12px !important;
+}
+[data-theme="pixel"] .rb-match {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  min-width: 10rem !important;
+  color: var(--px-ink) !important;
+}
+[data-theme="pixel"] .rb-track {
+  border: 2px solid var(--px-ink) !important;
+  background: var(--px-cream) !important;
+  height: 12px !important;
+  box-shadow: inset 2px 2px 0 0 rgba(22, 22, 42, 0.2);
+}
+[data-theme="pixel"] .rb-fill.sev-high {
+  background: repeating-linear-gradient(135deg, var(--px-red) 0 4px, #8a1020 4px 8px) !important;
+}
+[data-theme="pixel"] .rb-fill.sev-medium {
+  background: repeating-linear-gradient(135deg, var(--px-brass) 0 4px, #b89000 4px 8px) !important;
+}
+[data-theme="pixel"] .rb-fill.sev-low {
+  background: repeating-linear-gradient(135deg, #6a6a7e 0 4px, #3a3a4e 4px 8px) !important;
+}
+[data-theme="pixel"] .rb-swing {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  min-width: 4rem !important;
+}
+
+[data-theme="pixel"] .fd {
+  background: var(--px-card-2) !important;
+  border: 4px solid var(--px-ink) !important;
+  border-left-width: 8px !important;
+  box-shadow: var(--px-bezel);
+  padding: 12px !important;
+  margin-bottom: 8px !important;
+}
+[data-theme="pixel"] .fd-match {
+  font-family: var(--heading) !important;
+  font-size: 10px !important;
+  color: var(--px-ink) !important;
+  text-shadow: 2px 2px 0 var(--px-brass);
+  display: inline-block;
+  margin-bottom: 8px;
+}
+[data-theme="pixel"] .fd-chips { gap: 4px !important; margin-top: 8px !important; }
+[data-theme="pixel"] .fd-chip {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+  padding: 4px 6px !important;
+  border: 2px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+}
+[data-theme="pixel"] .fd-chip.cap {
+  background: var(--px-brass) !important;
+  color: var(--px-ink) !important;
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+}
+[data-theme="pixel"] .fd-swing {
+  font-family: var(--heading) !important;
+  font-size: 10px !important;
+  color: var(--px-red) !important;
+}
+[data-theme="pixel"] .fd-hl {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  line-height: 2 !important;
+  color: var(--px-ink) !important;
+  margin-top: 8px !important;
+  margin-bottom: 4px !important;
+}
+[data-theme="pixel"] .fd-body {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+  line-height: 1.35 !important;
+  color: var(--px-ink-2) !important;
+}
+[data-theme="pixel"] .fd-hint {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+  background: var(--yellow-soft) !important;
+  border: 2px dashed var(--px-ink) !important;
+  color: var(--px-ink) !important;
+  padding: 8px !important;
+  margin-top: 8px !important;
+  line-height: 1.35 !important;
+}
+
+/* Scenario cards narrative */
+[data-theme="pixel"] .sc-narr {
+  color: var(--px-ink) !important;
+  border-top: 2px dashed var(--px-ink) !important;
+}
+
+/* Risk attribution legend */
+[data-theme="pixel"] .ra-legend li { padding: 4px 0; }
+[data-theme="pixel"] .ra-t { font-size: 8px !important; }
+[data-theme="pixel"] .ra-pct { font-size: 8px !important; }
+[data-theme="pixel"] .ra-players {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+}
+
+/* Position-sizing vice-captain badge */
+[data-theme="pixel"] .ps-cap.vc {
+  background: var(--text-muted) !important;
+  color: var(--px-cream) !important;
+  border: 2px solid var(--px-ink);
+}
+
+/* Detail cards (player stats grid) */
+[data-theme="pixel"] .ds {
+  border: 3px solid var(--px-ink) !important;
+  background: var(--px-card-2) !important;
+  box-shadow: 2px 2px 0 0 var(--px-ink);
+}
+[data-theme="pixel"] .ds .mono {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+}
+[data-theme="pixel"] .ds .stat-label {
+  font-size: 6px !important;
+}
+
+/* Card header h2 — tame Press Start inside data cards */
+[data-theme="pixel"] .card > .card-header h2 { font-size: 8px !important; }
+
+/* Starting XI sparkline */
+[data-theme="pixel"] .xi-hero { align-items: flex-start !important; }
+[data-theme="pixel"] .xi-hero-copy .stat-value { text-shadow: 2px 2px 0 var(--px-brass); }
+[data-theme="pixel"] .xi-spark-col { width: 16px !important; }
+[data-theme="pixel"] .xi-spark-act {
+  border: 2px solid var(--px-ink);
+  border-bottom: none;
+  background: repeating-linear-gradient(135deg, var(--px-moss) 0 4px, #1f5f1f 4px 8px) !important;
+}
+[data-theme="pixel"] .xi-spark-exp { border-top: 3px solid var(--px-red) !important; }
+
+/* Player chip delta */
+[data-theme="pixel"] .chip-delta { color: var(--px-ink) !important; }
+
+/* Correlation Deep Dive */
+[data-theme="pixel"] .cdd-lookback-picker {
+  border-bottom: 4px solid var(--px-ink) !important;
+  padding-bottom: 8px !important;
+}
+[data-theme="pixel"] .cdd-lookback {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  border: 4px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel-sm) !important;
+  padding: 12px !important;
+}
+[data-theme="pixel"] .cdd-lookback.active {
+  background: var(--px-red) !important;
+  color: var(--px-cream) !important;
+}
+[data-theme="pixel"] .cdd-lookback.active::after { display: none !important; }
+[data-theme="pixel"] .cdd-context-row,
+[data-theme="pixel"] .cdd-week,
+[data-theme="pixel"] .cdd-team-chip,
+[data-theme="pixel"] .cdd-pattern,
+[data-theme="pixel"] .cdd-pair-row,
+[data-theme="pixel"] .sim-corrs {
+  background: var(--px-card-2) !important;
+  border: 4px solid var(--px-ink) !important;
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel) !important;
+}
+[data-theme="pixel"] .cdd-context-row { border-left-width: 8px !important; }
+[data-theme="pixel"] .cdd-week { padding: 12px !important; }
+[data-theme="pixel"] .cdd-team-chip { padding: 8px 12px !important; }
+[data-theme="pixel"] .cdd-pattern {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+  line-height: 1.8 !important;
+}
+[data-theme="pixel"] .cdd-team-top,
+[data-theme="pixel"] .cdd-pairs-head .small {
+  font-family: var(--heading) !important;
+  font-size: 6px !important;
+}
+[data-theme="pixel"] .cdd-context-title,
+[data-theme="pixel"] .cdd-pair-names {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+  line-height: 1.8 !important;
+}
+[data-theme="pixel"] .cdd-context-body,
+[data-theme="pixel"] .cdd-team-note,
+[data-theme="pixel"] .cdd-pair-text,
+[data-theme="pixel"] .corr-shift {
+  font-family: var(--font) !important;
+  font-size: 14px !important;
+  color: var(--px-ink) !important;
+}
+[data-theme="pixel"] .cdd-pos-cell {
+  border: 2px solid var(--px-ink) !important;
+  background: var(--px-card) !important;
+}
+[data-theme="pixel"] .cdd-pos-cell .mono,
+[data-theme="pixel"] .cdd-pair-rho,
+[data-theme="pixel"] .corr-shift .mono {
+  font-family: var(--heading) !important;
+  font-size: 8px !important;
+}
+[data-theme="pixel"] .cdd-pair-row.selected {
+  box-shadow:
+    inset 2px 2px 0 0 rgba(255, 255, 255, 0.55),
+    var(--px-bezel-red) !important;
+}
+
+/* ── View-transition colorisation for pixel theme ─────────────── */
+[data-theme="pixel"] ::view-transition-old(root),
+[data-theme="pixel"] ::view-transition-new(root) {
+  animation-duration: 120ms;
+  animation-timing-function: steps(3, end);
+}
