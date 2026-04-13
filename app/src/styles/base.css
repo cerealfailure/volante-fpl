@@ -1,0 +1,581 @@
+/*
+  Volante — Base design system.
+  Defaults track the `clean` theme so SSR paint is correct.
+  Theme files under /themes/*.css override via [data-theme="..."].
+
+  Progressive enhancement stack:
+  - @property for typed CSS vars (animatable gradients)
+  - color-mix in oklch for perceptual tint derivation
+  - @starting-style for no-JS enter animations
+  - animation-timeline: view() as scroll-linked reveal (graceful fallback)
+*/
+
+@import url('https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700;12..96,800&family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
+
+/* ── Animatable gradient stops (Chrome/Safari/FF 2024+) ───────── */
+@property --sheen-x {
+  syntax: '<percentage>';
+  inherits: false;
+  initial-value: 0%;
+}
+@property --glow-opacity {
+  syntax: '<number>';
+  inherits: false;
+  initial-value: 0;
+}
+
+:root {
+  /* Canvas */
+  --bg: #050d0a;
+  --bg-warm: #071512;
+  --bg-elevated: #0c1e18;
+  --bg-card: #0f251e;
+  --bg-card-hover: #132e25;
+  --bg-selected: rgba(0, 255, 156, 0.06);
+  --bg-glass: rgba(12, 30, 24, 0.82);
+
+  /* Lines — hairlines derived perceptually */
+  --border: color-mix(in oklch, var(--text) 7%, transparent);
+  --border-hover: color-mix(in oklch, var(--text) 16%, transparent);
+  --border-accent: color-mix(in oklch, var(--accent) 40%, transparent);
+  --border-glow: color-mix(in oklch, var(--accent) 18%, transparent);
+  --chalk: rgba(232, 255, 241, 0.88);
+
+  /* Text */
+  --text: #e8fff1;
+  --text-secondary: #94b3a6;
+  --text-muted: #56776b;
+  --text-heading: #ffffff;
+
+  /* Accents */
+  --accent: #00ff9c;
+  --accent-soft: color-mix(in oklch, var(--accent) 12%, transparent);
+  --accent-text: #5cffbc;
+  --accent-deep: #00b86e;
+
+  --green: #00ff9c;
+  --green-soft: color-mix(in oklch, var(--green) 14%, transparent);
+  --red: #ff3d5a;
+  --red-soft: color-mix(in oklch, var(--red) 14%, transparent);
+  --yellow: #ffd166;
+  --yellow-soft: color-mix(in oklch, var(--yellow) 16%, transparent);
+  --blue: #4ea4ff;
+  --purple: #b36bff;
+
+  /* Type */
+  --font: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+  --mono: 'JetBrains Mono', 'SF Mono', ui-monospace, monospace;
+  --heading: 'Bricolage Grotesque', 'Inter', -apple-system, sans-serif;
+
+  /* Deliberate type scale with gaps — 12 / 13 / 14 / 18 / 24 / 32 / 44 / 64
+     Skipping 16/20 on purpose (the indecisive slop sizes). */
+  --fs-11: 0.6875rem;  /* 11 — micro mono caption */
+  --fs-12: 0.75rem;    /* 12 — eyebrow, label */
+  --fs-13: 0.8125rem;  /* 13 — small body */
+  --fs-14: 0.875rem;   /* 14 — body default */
+  --fs-18: 1.125rem;   /* 18 — heading sm */
+  --fs-24: 1.5rem;     /* 24 — heading md */
+  --fs-32: 2rem;       /* 32 — h1 */
+  --fs-44: 2.75rem;    /* 44 — display */
+  --fs-64: 4rem;       /* 64 — display xl */
+
+  /* Geometry */
+  --radius: 4px;
+  --radius-sm: 2px;
+  --radius-lg: 6px;
+  --radius-xl: 10px;
+
+  /* Shell — one canonical width, tight gutter */
+  --shell-max: 1160px;
+  --gutter: 1.5rem;
+
+  /* Elevation */
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.45);
+  --shadow-md: 0 6px 24px rgba(0, 0, 0, 0.5);
+  --shadow-lg: 0 14px 50px rgba(0, 0, 0, 0.6);
+  --shadow-glow: 0 0 0 1px rgba(0, 255, 156, 0.35), 0 8px 40px rgba(0, 255, 156, 0.10);
+
+  /* Motion — Vercel spring + ease-out-expo. No ease-in-out (generic tell). */
+  --ease: cubic-bezier(0.32, 0.72, 0, 1);            /* Vercel spring */
+  --ease-out-expo: cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-out-back: cubic-bezier(0.34, 1.42, 0.64, 1);
+  --duration-fast: 120ms;
+  --duration: 200ms;
+  --duration-lg: 380ms;
+  --duration-xl: 560ms;
+
+  /* FDR difficulty */
+  --corr-neg: var(--blue);
+  --corr-zero: var(--bg-card);
+  --corr-pos: var(--red);
+  --fdr-1: #00ff9c;
+  --fdr-2: #6aff9d;
+  --fdr-3: #94b3a6;
+  --fdr-4: #ffd166;
+  --fdr-5: #ff3d5a;
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+html {
+  text-size-adjust: 100%;
+  /* Intentionally NOT scroll-behavior:smooth — data apps should jump instantly */
+}
+
+html, body {
+  font-family: var(--font);
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.5;
+  min-height: 100%;
+  color-scheme: dark;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'ss01', 'cv11';
+  font-optical-sizing: auto;
+}
+
+body {
+  background:
+    radial-gradient(ellipse 80% 55% at 50% -5%, rgba(0, 255, 156, 0.055), transparent 72%),
+    var(--bg);
+}
+
+a {
+  color: inherit;
+  text-decoration-color: color-mix(in srgb, currentColor 45%, transparent);
+  text-underline-offset: 0.16em;
+}
+
+/* Tabular numerals EVERYWHERE numbers live — the #1 non-slop tell */
+table, td, th,
+.mono, .tabular,
+.stat, .stat-value, .stat-label,
+.sb-val, .sb-label {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum', 'ss01', 'cv11';
+}
+
+/* ── Typography ──────────────────────────────────────── */
+
+h1 {
+  font-family: var(--heading);
+  font-size: clamp(var(--fs-32), 3.2vw, 2.65rem);
+  font-weight: 800;
+  letter-spacing: -0.035em;
+  line-height: 1.02;
+  color: var(--text-heading);
+  text-wrap: balance;
+}
+h1.display {
+  font-size: clamp(var(--fs-44), 5.8vw, var(--fs-64));
+  letter-spacing: -0.042em;
+  line-height: 0.93;
+}
+h2 {
+  font-family: var(--heading);
+  font-size: var(--fs-18);
+  font-weight: 700;
+  letter-spacing: -0.022em;
+  line-height: 1.1;
+  color: var(--text-heading);
+  text-wrap: balance;
+}
+h3 {
+  font-family: var(--mono);
+  font-size: 0.66rem;
+  font-weight: 600;
+  color: var(--accent-text);
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+}
+p { text-wrap: pretty; }
+
+.mono { font-family: var(--mono); }
+.dim { color: var(--text-secondary); }
+.dim2 { color: var(--text-muted); }
+.accent { color: var(--accent-text); }
+.small { font-size: var(--fs-13); }
+
+/* ── Layout ──────────────────────────────────────────── */
+
+.container {
+  max-width: var(--shell-max);
+  margin: 0 auto;
+  padding: 0 var(--gutter);
+  width: 100%;
+}
+
+/* ── Cards ───────────────────────────────────────────── */
+
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 1.1rem;
+  transition: border-color var(--duration) var(--ease),
+              background var(--duration) var(--ease),
+              transform var(--duration) var(--ease);
+}
+.card:hover {
+  border-color: var(--border-hover);
+  background: var(--bg-card-hover);
+}
+
+/* :has() — when a card holds a selected child, highlight it */
+.card:has(.active, [aria-selected="true"]) {
+  border-color: var(--border-accent);
+}
+
+.card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 1rem;
+  gap: 1rem;
+}
+
+/* ── Stats ───────────────────────────────────────────── */
+
+.stat { display: flex; flex-direction: column; gap: 0.2rem; }
+.stat-value {
+  font-family: var(--heading);
+  font-size: var(--fs-24);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+  line-height: 1;
+  color: var(--text-heading);
+}
+.stat-label {
+  font-family: var(--mono);
+  font-size: 0.6rem;
+  text-transform: uppercase;
+  letter-spacing: 0.14em;
+  color: var(--text-muted);
+}
+
+/* ── Buttons ─────────────────────────────────────────── */
+
+button {
+  font-family: var(--font);
+  cursor: pointer;
+  border: none;
+  border-radius: var(--radius);
+  font-size: var(--fs-14);
+  font-weight: 600;
+  /* Hover changes ONE property (background). No multi-prop tweens. */
+  transition: background var(--duration-fast) var(--ease),
+              color var(--duration-fast) var(--ease),
+              border-color var(--duration-fast) var(--ease),
+              transform var(--duration-fast) var(--ease),
+              filter var(--duration-fast) var(--ease);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.45rem;
+}
+
+button, a, input { -webkit-tap-highlight-color: transparent; }
+
+/* Double-ring focus — the "crafted" tell from Vercel/Linear */
+button:focus-visible,
+a:focus-visible,
+input:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 4px color-mix(in oklch, var(--accent) 20%, transparent);
+  border-radius: var(--radius);
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: #041a10;
+  padding: 0.65rem 1.25rem;
+  box-shadow: var(--shadow-sm);
+}
+.btn-primary:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+.btn-primary:active { transform: translateY(0); filter: brightness(0.95); }
+.btn-primary:disabled { opacity: 0.4; cursor: not-allowed; transform: none; filter: none; }
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  padding: 0.5rem 1rem;
+}
+.btn-ghost:hover { border-color: var(--border-hover); color: var(--text); }
+
+/* ── Inputs ──────────────────────────────────────────── */
+
+input[type="text"], input[type="number"], input[type="search"] {
+  font-family: var(--mono);
+  background: var(--bg-elevated);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  color: var(--text);
+  padding: 0.65rem 0.85rem;
+  font-size: var(--fs-14);
+  outline: none;
+  transition: border-color var(--duration-fast) var(--ease),
+              background var(--duration-fast) var(--ease);
+}
+input:focus {
+  border-color: var(--accent);
+  background: color-mix(in oklch, var(--accent) 5%, var(--bg-elevated));
+}
+
+/* ── Badges ──────────────────────────────────────────── */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 0.2rem 0.55rem;
+  border-radius: 100px;
+  font-size: 0.62rem;
+  font-weight: 600;
+  font-family: var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  border: 1px solid transparent;
+}
+.badge-accent { background: var(--accent-soft); color: var(--accent-text); border-color: var(--border-accent); }
+.badge-green  { background: var(--green-soft);  color: var(--green); }
+.badge-red    { background: var(--red-soft);    color: var(--red); }
+.badge-yellow { background: var(--yellow-soft); color: var(--yellow); }
+.badge-blue   { background: color-mix(in oklch, var(--blue) 14%, transparent); color: var(--blue); }
+
+/* ── Tooltip ─────────────────────────────────────────── */
+
+.tooltip {
+  position: absolute;
+  background: var(--bg-elevated);
+  border: 1px solid var(--border-hover);
+  border-radius: var(--radius);
+  padding: 0.45rem 0.65rem;
+  font-size: 0.72rem;
+  font-family: var(--mono);
+  pointer-events: none;
+  z-index: 100;
+  white-space: nowrap;
+  box-shadow: var(--shadow-md);
+}
+
+/* ── Scrollbar ───────────────────────────────────────── */
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 100px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--border-hover); }
+
+/* ── Motion — reveal stagger (one system) ───────────────
+   Parent: .reveal.
+   Children: style="--i:N" for stagger delay.
+   Capped at --i:8 — never stagger more than 8 items.
+   ──────────────────────────────────────────────────── */
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
+.loading { animation: pulse 1.5s ease-in-out infinite; }
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.fade-in { animation: fadeIn 380ms var(--ease) both; }
+
+@keyframes revealUp {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+.reveal > * {
+  animation: revealUp 420ms var(--ease-out-expo) both;
+  animation-delay: calc(min(var(--i, 0), 7) * 35ms + 40ms);
+}
+/* Fallback stagger when --i isn't set inline. Inline style wins. */
+.reveal > *:nth-child(1) { --i: 0; }
+.reveal > *:nth-child(2) { --i: 1; }
+.reveal > *:nth-child(3) { --i: 2; }
+.reveal > *:nth-child(4) { --i: 3; }
+.reveal > *:nth-child(5) { --i: 4; }
+.reveal > *:nth-child(6) { --i: 5; }
+.reveal > *:nth-child(7) { --i: 6; }
+.reveal > *:nth-child(n+8) { --i: 7; }
+
+@keyframes kickoff {
+  0%   { transform: scale(0.94); opacity: 0; }
+  60%  { transform: scale(1.02); }
+  100% { transform: scale(1); opacity: 1; }
+}
+.kickoff { animation: kickoff 360ms var(--ease-out-back) both; }
+
+@keyframes drawLine {
+  from { transform: scaleX(0); }
+  to   { transform: scaleX(1); }
+}
+
+/* @starting-style — declarative enter animation for any element
+   that appears via state change (toasts, drawers, popovers) */
+@supports (transition-behavior: allow-discrete) {
+  .enter {
+    transition: opacity var(--duration) var(--ease),
+                transform var(--duration) var(--ease);
+  }
+  @starting-style {
+    .enter {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+  }
+}
+
+/* Scroll-driven progressive enhancement — sections fade in on first scroll
+   reach. Graceful fallback: nothing happens, sections already visible. */
+@supports (animation-timeline: view()) {
+  .scroll-reveal {
+    animation: revealUp linear both;
+    animation-timeline: view();
+    animation-range: entry 0% entry 45%;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* ── View Transitions (same-doc SPA transitions) ─────── */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: var(--duration-lg);
+  animation-timing-function: var(--ease);
+}
+::view-transition-old(root) {
+  animation-name: vt-fade-out;
+}
+::view-transition-new(root) {
+  animation-name: vt-fade-in;
+}
+@keyframes vt-fade-out {
+  to { opacity: 0; transform: translateY(-4px); }
+}
+@keyframes vt-fade-in {
+  from { opacity: 0; transform: translateY(6px); }
+}
+
+/* ── Utility ─────────────────────────────────────────── */
+
+.positive { color: var(--green) !important; }
+.negative { color: var(--red) !important; }
+.warning  { color: var(--yellow) !important; }
+
+/* Right-align numbers — Bloomberg/Koyfin rule */
+.num { font-variant-numeric: tabular-nums; text-align: right; font-family: var(--mono); }
+
+/* Eyebrow label — small mono accent tag above headings */
+.eyebrow {
+  font-family: var(--mono);
+  font-size: var(--fs-12);
+  font-weight: 600;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--accent-text);
+  display: inline-flex;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+/* Chalk-line divider — hairline with dash pattern */
+.chalk-line {
+  height: 1px;
+  background: repeating-linear-gradient(90deg, var(--chalk) 0 6px, transparent 6px 12px);
+  opacity: 0.22;
+  border: none;
+}
+/* Plain hairline */
+.hairline {
+  height: 1px;
+  background: var(--border);
+  border: none;
+}
+
+.page-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 1.25rem;
+}
+
+.page-hero {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 1rem;
+  padding-bottom: 1.1rem;
+  border-bottom: 1px solid var(--border);
+  flex-wrap: wrap;
+}
+.page-hero h1 { margin: 0.1rem 0 0; }
+.page-hero p {
+  margin: 0.4rem 0 0;
+  max-width: 62ch;
+  color: var(--text-secondary);
+}
+
+.section-headline {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-end;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+}
+
+.surface-note {
+  padding: 0.75rem 0.9rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--bg-elevated);
+  color: var(--text-secondary);
+  font-size: var(--fs-13);
+}
+
+.loading-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+  padding: 2.75rem 0;
+}
+
+.spinner {
+  width: 20px;
+  height: 20px;
+  border: 2px solid var(--border);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.row { display: flex; align-items: center; gap: 0.5rem; }
+.row-tight { display: flex; align-items: center; gap: 0.3rem; }
+
+.icon-inline { display: inline-flex; align-items: center; vertical-align: -0.15em; }
+
+/* ── Theme-paired visibility ─────────────────────────── */
+[data-theme="clean"] .pixel-only { display: none !important; }
+[data-theme="pixel"] .clean-only { display: none !important; }
+
+@media (max-width: 720px) {
+  :root { --gutter: 1rem; }
+  .page-stack { gap: 1rem; }
+}

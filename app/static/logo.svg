@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!--
+    VOLANTE mark v2 — the V cradles the ball.
+
+    A wide, confident chevron stroke forms an open cup.
+    A classic 12-panel football sits at the vertex, as if
+    caught clean off a laser pass from the deep-lying
+    playmaker. Reads as one unified mark at 16px.
+  -->
+
+  <!-- Pitch-chip background -->
+  <rect width="32" height="32" rx="8" fill="#0b2018"/>
+
+  <!-- Subtle mower-stripe texture -->
+  <rect x="0" y="0"  width="32" height="8"  fill="#0f2920" opacity="0.5"/>
+  <rect x="0" y="16" width="32" height="8"  fill="#0f2920" opacity="0.5"/>
+
+  <!-- Corner pitch hash -->
+  <path d="M3 5 L3 3 L5 3" stroke="#e8fff1" stroke-width="0.8" stroke-linecap="round" opacity="0.35"/>
+  <path d="M29 5 L29 3 L27 3" stroke="#e8fff1" stroke-width="0.8" stroke-linecap="round" opacity="0.35"/>
+  <path d="M3 27 L3 29 L5 29" stroke="#e8fff1" stroke-width="0.8" stroke-linecap="round" opacity="0.35"/>
+  <path d="M29 27 L29 29 L27 29" stroke="#e8fff1" stroke-width="0.8" stroke-linecap="round" opacity="0.35"/>
+
+  <!-- The V — wide, confident chevron in neon pitch green -->
+  <path d="M4 9 L16 25 L28 9"
+        fill="none"
+        stroke="#00ff9c"
+        stroke-width="3.4"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+
+  <!-- Ball cradled in the V vertex -->
+  <circle cx="16" cy="19" r="4.3" fill="#ffffff"/>
+  <!-- Classic football panel seams -->
+  <path d="M16 15.3 L18.5 17.1 L17.5 20.2 L14.5 20.2 L13.5 17.1 Z"
+        fill="#0b2018"/>
+  <path d="M16 15.3 L16 13.9" stroke="#0b2018" stroke-width="0.8" stroke-linecap="round"/>
+  <path d="M18.5 17.1 L19.9 16.5" stroke="#0b2018" stroke-width="0.8" stroke-linecap="round"/>
+  <path d="M13.5 17.1 L12.1 16.5" stroke="#0b2018" stroke-width="0.8" stroke-linecap="round"/>
+  <path d="M14.5 20.2 L13.6 21.7" stroke="#0b2018" stroke-width="0.8" stroke-linecap="round"/>
+  <path d="M17.5 20.2 L18.4 21.7" stroke="#0b2018" stroke-width="0.8" stroke-linecap="round"/>
+</svg>

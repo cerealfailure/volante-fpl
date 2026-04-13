@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.thenameszinski.volante-api</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/thenameszinski/volante/scripts/volante-api.sh</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>/Users/thenameszinski/volante</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/thenameszinski/Library/Logs/volante-api.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/thenameszinski/Library/Logs/volante-api.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>HOME</key>
+    <string>/Users/thenameszinski</string>
+    <key>VOLANTE_API_HOST</key>
+    <string>0.0.0.0</string>
+    <key>VOLANTE_API_PORT</key>
+    <string>8555</string>
+    <key>VOLANTE_ALLOW_ORIGIN_REGEX</key>
+    <string>^https?://[^/]+(:[0-9]+)?$</string>
+  </dict>
+</dict>
+</plist>
