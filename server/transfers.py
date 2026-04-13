@@ -399,10 +399,10 @@ async def _historical_transfer_correlation_effect(database, manager_id: int, tra
 def _scorecard_group(rows: list[dict]) -> dict:
     if not rows:
         return {"count": 0, "avg_alpha": None, "win_rate": None}
-    wins = sum(1 for row in rows if row["pts_delta"] > 0)
+    wins = sum(1 for row in rows if (row.get("net_pts_delta") or row["pts_delta"]) > 0)
     return {
         "count": len(rows),
-        "avg_alpha": round(sum(row["pts_delta"] for row in rows) / len(rows), 1),
+        "avg_alpha": round(sum(row.get("net_pts_delta", row["pts_delta"]) for row in rows) / len(rows), 1),
         "win_rate": round(wins / len(rows) * 100, 1),
     }
 
@@ -427,10 +427,10 @@ def _build_correlation_scorecard(rows: list[dict]) -> dict:
     if improved_avg is None:
         headline = "Matrix-aware starter snapshots are available, but none of the transfers improved diversification."
     elif worsened_avg is None:
-        headline = f"Transfers that improved ENB or reduced concentration averaged {improved_avg:+.1f} points."
+        headline = f"Transfers that improved ENB or reduced concentration averaged {improved_avg:+.1f} net points after hits."
     else:
         headline = (
-            f"Transfers that improved ENB or reduced concentration averaged {improved_avg:+.1f} points, "
+            f"Transfers that improved ENB or reduced concentration averaged {improved_avg:+.1f} net points after hits, "
             f"versus {worsened_avg:+.1f} when the matrix got worse."
         )
 
@@ -495,6 +495,9 @@ async def analyze_past_transfers(manager_id: int) -> dict:
                 pts_delta = in_pts_after - out_pts_after
                 gws_remaining = max(current_event - gw + 1, 1)
                 per_gw_alpha = pts_delta / gws_remaining
+                hit_cost_share = hit_cost / max(len(gw_transfers), 1)
+                net_pts_delta = pts_delta - hit_cost_share
+                net_per_gw_alpha = net_pts_delta / gws_remaining
 
                 # knee-jerk detection: sold player had good xGI but bad last GW
                 is_knee_jerk = False
@@ -505,7 +508,7 @@ async def analyze_past_transfers(manager_id: int) -> dict:
                         is_knee_jerk = True
                         knee_jerks += 1
 
-                total_alpha += pts_delta
+                total_alpha += net_pts_delta
                 correlation_tradeoff = await _historical_transfer_correlation_effect(database, manager_id, t)
 
                 scored.append({
@@ -516,6 +519,9 @@ async def analyze_past_transfers(manager_id: int) -> dict:
                     "out_pts_after": out_pts_after,
                     "pts_delta": pts_delta,
                     "per_gw_alpha": round(per_gw_alpha, 2),
+                    "hit_cost_share": round(hit_cost_share, 2),
+                    "net_pts_delta": round(net_pts_delta, 2),
+                    "net_per_gw_alpha": round(net_per_gw_alpha, 2),
                     "was_hit": gw in hit_gws,
                     "is_knee_jerk": is_knee_jerk,
                     "verdict": "good" if pts_delta > 5 else ("bad" if pts_delta < -5 else "neutral"),
