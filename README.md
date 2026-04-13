@@ -57,7 +57,16 @@ It will:
 - estimate whether the move improved or worsened diversification
 - summarize whether ENB-improving moves actually outperformed concentration-increasing ones
 
-That gives you a concrete way to test whether using the matrix is helping rather than relying on feel.
+In the Transfers screen, the history panel now shows two checks for each move:
+
+- `Alpha/GW`: realized points gained or lost per remaining gameweek, which makes early and late-season transfers comparable
+- `Matrix`: whether the move lifted ENB / reduced concentration (`Up`) or pushed the squad into a tighter stack (`Down`)
+
+That gives you a concrete way to test whether using the matrix is helping rather than relying on feel:
+
+- compare the `ENB Up` bucket vs the `ENB Down` bucket in the scorecard
+- inspect individual moves where the matrix said `Up` but the realized alpha was negative, or vice versa
+- keep using `Alpha/GW` rather than raw points when judging the process, because old transfers had more time to accumulate returns
 
 ## Notes
 
