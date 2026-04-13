@@ -150,6 +150,14 @@
     rows.sort((a: any, b: any) => Math.abs(b.delta ?? 0) - Math.abs(a.delta ?? 0));
     return rows.slice(0, 3);
   });
+  let transferAnalysisByKey = $derived.by(() => {
+    const rows = transferAnalysis?.transfers ?? [];
+    const map = new Map<string, any>();
+    for (const row of rows) {
+      map.set(historyScoreKey(row), row);
+    }
+    return map;
+  });
 
   let activeDrop = $derived(
     activeDropId != null
@@ -203,6 +211,30 @@
   function focusDrop(id: number) {
     activeDropId = id;
     browseMode = false;
+  }
+
+  function historyScoreKey(row: any) {
+    return `${row?.event ?? '—'}|${row?.out_name ?? ''}|${row?.in_name ?? ''}`;
+  }
+
+  function historyAnalysisFor(row: any) {
+    return transferAnalysisByKey.get(historyScoreKey(row));
+  }
+
+  function alphaPerGwLabel(row: any) {
+    const alpha = row?.per_gw_alpha;
+    if (typeof alpha !== 'number' || Number.isNaN(alpha)) return '—';
+    return `${alpha >= 0 ? '+' : ''}${alpha.toFixed(2)}`;
+  }
+
+  function matrixTradeoffLabel(row: any) {
+    const tradeoff = row?.correlation_tradeoff;
+    if (!tradeoff?.available) return '—';
+    const enb = tradeoff?.delta?.enb;
+    const enbText = typeof enb === 'number' ? `${enb >= 0 ? '+' : ''}${enb.toFixed(1)} ENB` : 'flat';
+    if (tradeoff.direction === 'improved') return `Up ${enbText}`;
+    if (tradeoff.direction === 'worsened') return `Down ${enbText}`;
+    return `Flat ${enbText}`;
   }
 
   async function earmark(candidate: any) {
@@ -626,10 +658,13 @@
                   <th class="r">Sell</th>
                   <th>In</th>
                   <th class="r">Buy</th>
+                  <th class="r">Alpha/GW</th>
+                  <th>Matrix</th>
                 </tr>
               </thead>
               <tbody>
                 {#each history as t}
+                  {@const scored = historyAnalysisFor(t)}
                   <tr>
                     <td class="dim2 small">{new Date(t.time).toLocaleDateString()}</td>
                     <td class="mono">{t.event ?? '—'}</td>
@@ -637,6 +672,18 @@
                     <td class="r mono">£{t.out_cost?.toFixed(1) ?? '—'}</td>
                     <td>{t.in_name}</td>
                     <td class="r mono">£{t.in_cost?.toFixed(1) ?? '—'}</td>
+                    <td class="r mono {scored?.per_gw_alpha > 0 ? 'positive' : scored?.per_gw_alpha < 0 ? 'negative' : ''}">
+                      {alphaPerGwLabel(scored)}
+                    </td>
+                    <td>
+                      {#if scored?.correlation_tradeoff?.available}
+                        <span class="matrix-pill matrix-{scored.correlation_tradeoff.direction}">
+                          {matrixTradeoffLabel(scored)}
+                        </span>
+                      {:else}
+                        <span class="dim2 small">—</span>
+                      {/if}
+                    </td>
                   </tr>
                 {/each}
               </tbody>
@@ -1159,6 +1206,30 @@
   .history-body td { padding: 0.45rem 0.6rem; border-bottom: 1px dashed var(--border); white-space: nowrap; }
   .history-body tr:hover td { background: var(--bg-card-hover); }
   .history-body .r { text-align: right; }
+  .matrix-pill {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.18rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    font-size: 0.68rem;
+    font-family: var(--mono);
+    letter-spacing: 0.01em;
+  }
+  .matrix-pill.matrix-improved {
+    color: var(--accent-text);
+    border-color: var(--border-accent);
+    background: var(--accent-soft);
+  }
+  .matrix-pill.matrix-worsened {
+    color: var(--red);
+    border-color: color-mix(in srgb, var(--red) 40%, var(--border));
+    background: color-mix(in srgb, var(--red) 12%, transparent);
+  }
+  .matrix-pill.matrix-flat {
+    color: var(--text-secondary);
+  }
 
   @media (max-width: 980px) {
     .planner-grid { grid-template-columns: 1fr; }
