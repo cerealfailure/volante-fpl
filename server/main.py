@@ -16,23 +16,85 @@ Endpoints:
   GET  /api/status               — data freshness
 """
 
+import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+import hmac
 import os
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import db
 import fpl
 import analysis
 import fixture_exposure
+import intel as intel_engine
 import transfers as transfers_engine
+
+VOLANTE_MODE = os.environ.get("VOLANTE_MODE", "fpl_only").strip().lower()
+if VOLANTE_MODE not in {"fpl_only", "overall"}:
+    VOLANTE_MODE = "fpl_only"
+INTEL_HTTP_TOKEN = os.environ.get("VOLANTE_INTEL_TOKEN")
+ALLOW_ANY_ORIGIN_REGEX = r"^https?://[^/]+(?::\d+)?$"
+
+
+def _internal_mode_enabled() -> bool:
+    return VOLANTE_MODE == "overall"
+
+
+def _extract_bearer_token(request: Request) -> str | None:
+    header = request.headers.get("authorization", "").strip()
+    if not header.lower().startswith("bearer "):
+        return None
+    token = header[7:].strip()
+    return token or None
+
+
+def _require_intel_access(request: Request):
+    if not _internal_mode_enabled():
+        raise HTTPException(404, "Private transfer intelligence is disabled in fpl_only mode")
+    if INTEL_HTTP_TOKEN:
+        provided = request.headers.get("x-volante-token") or _extract_bearer_token(request)
+        if not provided or not hmac.compare_digest(provided, INTEL_HTTP_TOKEN):
+            raise HTTPException(403, "Missing or invalid transfer-intel token")
+        return
+    client_host = (request.client.host if request.client else "") or ""
+    if client_host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(
+            403,
+            "Private transfer intelligence is local-only unless VOLANTE_INTEL_TOKEN is configured",
+        )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
-    yield
+    if _internal_mode_enabled():
+        conn = await db.get_db()
+        try:
+            await intel_engine.ensure_intel_defaults(conn)
+            await conn.commit()
+        finally:
+            await conn.close()
+
+    intel_task = None
+    intel_manager_id = os.environ.get("VOLANTE_INTEL_MANAGER_ID")
+    if _internal_mode_enabled() and intel_manager_id:
+        horizon = int(os.environ.get("VOLANTE_INTEL_HORIZON", "5"))
+        interval_minutes = int(os.environ.get("VOLANTE_INTEL_INTERVAL_MINUTES", "60"))
+        intel_task = asyncio.create_task(
+            intel_engine.run_intel_loop(int(intel_manager_id), horizon=horizon, interval_minutes=interval_minutes)
+        )
+
+    try:
+        yield
+    finally:
+        if intel_task is not None:
+            intel_task.cancel()
+            try:
+                await intel_task
+            except asyncio.CancelledError:
+                pass
 
 
 app = FastAPI(title="Volante", version="0.2.0", lifespan=lifespan)
@@ -48,7 +110,7 @@ allow_origins = [
     for origin in os.environ.get("VOLANTE_ALLOW_ORIGINS", ",".join(DEFAULT_ALLOW_ORIGINS)).split(",")
     if origin.strip()
 ]
-allow_origin_regex = os.environ.get("VOLANTE_ALLOW_ORIGIN_REGEX")
+allow_origin_regex = os.environ.get("VOLANTE_ALLOW_ORIGIN_REGEX", ALLOW_ANY_ORIGIN_REGEX)
 
 app.add_middleware(
     CORSMiddleware,
@@ -67,6 +129,25 @@ class SyncManagerRequest(BaseModel):
 class TransferSimRequest(BaseModel):
     player_out: int
     player_in: int
+
+
+class IntelImportRequest(BaseModel):
+    path: str
+    source_key: str
+    label: str | None = None
+    event: int | None = None
+    horizon: int = 5
+
+
+class TransferPlanPick(BaseModel):
+    sell_id: int
+    buy_id: int
+
+
+class TransferPlanSimRequest(BaseModel):
+    picks: list[TransferPlanPick]
+    event: int | None = None
+    horizon: int = 5
 
 
 def _http_from_fpl_error(exc: Exception) -> HTTPException:
@@ -311,6 +392,25 @@ async def simulate_transfer(manager_id: int, req: TransferSimRequest, event: int
         raise HTTPException(500, str(e))
 
 
+@app.post("/api/xray/{manager_id}/simulate-plan")
+async def simulate_transfer_plan(manager_id: int, req: TransferPlanSimRequest):
+    """Simulate an exact multi-transfer plan."""
+    try:
+        result = await transfers_engine.simulate_transfer_plan(
+            manager_id,
+            [pick.model_dump() for pick in req.picks],
+            event=req.event,
+            horizon=req.horizon,
+        )
+        return result
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
 # ── Player Browser ───────────────────────────────────────────────────
 
 @app.get("/api/players")
@@ -414,6 +514,11 @@ async def status(manager_id: int | None = None):
             rows = await conn.execute_fetchall(f"SELECT count(*) as c FROM {table}")
             counts[table] = rows[0]["c"]
         payload = {
+            "mode": {
+                "name": VOLANTE_MODE,
+                "intel_http_enabled": _internal_mode_enabled(),
+                "intel_token_required": bool(INTEL_HTTP_TOKEN),
+            },
             "synced": {
                 "bootstrap": _synced_at(bootstrap_sync),
                 "fixtures": _synced_at(fixtures_sync),
@@ -960,6 +1065,7 @@ async def gameweek_status():
 class RecommendRequest(BaseModel):
     sell_ids: list[int]
     n: int = 5
+    horizon: int = 5
 
 
 @app.post("/api/xray/{manager_id}/recommend")
@@ -967,7 +1073,7 @@ async def recommend_transfers(manager_id: int, req: RecommendRequest):
     """Get smart replacement recommendations for 1+ players."""
     try:
         result = await transfers_engine.recommend_replacements(
-            manager_id, req.sell_ids, n=req.n,
+            manager_id, req.sell_ids, n=req.n, horizon=req.horizon,
         )
         return result
     except ValueError as e:
@@ -998,6 +1104,68 @@ async def transfer_analysis(manager_id: int):
 
         result = await transfers_engine.analyze_past_transfers(manager_id)
         return result
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/intel/import-csv", include_in_schema=_internal_mode_enabled())
+async def import_intel_csv(req: IntelImportRequest, request: Request):
+    """Import a local CSV snapshot of external projections into the intel DB."""
+    try:
+        _require_intel_access(request)
+        return await intel_engine.import_projection_csv(
+            req.path,
+            req.source_key,
+            label=req.label,
+            event=req.event,
+            horizon=req.horizon,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.post("/api/intel/{manager_id}/run", include_in_schema=_internal_mode_enabled())
+async def run_private_intel(
+    manager_id: int,
+    request: Request,
+    horizon: int = Query(default=5, ge=1, le=8),
+    event: int | None = None,
+    deliver: bool = True,
+):
+    """Run the private transfer intelligence analyzer and persist alerts."""
+    try:
+        _require_intel_access(request)
+        await _ensure_core_cache()
+        return await intel_engine.run_transfer_intelligence(
+            manager_id,
+            event=event,
+            horizon=horizon,
+            persist=True,
+            deliver=deliver,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/intel/{manager_id}/alerts", include_in_schema=_internal_mode_enabled())
+async def get_private_intel_alerts(
+    manager_id: int,
+    request: Request,
+    status: str | None = Query(default=None),
+    limit: int = Query(default=20, ge=1, le=100),
+):
+    """Read stored private intel alerts for a manager."""
+    try:
+        _require_intel_access(request)
+        alerts = await intel_engine.list_alerts(manager_id, status=status, limit=limit)
+        return {"alerts": alerts}
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(500, str(e))
@@ -1037,4 +1205,4 @@ async def squad_fixture_exposure(manager_id: int, event: int | None = None):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=8555, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8555, reload=True)

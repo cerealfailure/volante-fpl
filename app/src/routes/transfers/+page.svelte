@@ -14,6 +14,7 @@
     getTransferAnalysis,
     recommendReplacements,
     simulateTransfer,
+    simulateTransferPlan,
     getPlayers,
   } from '$lib/api';
   import { managerId } from '$lib/session';
@@ -22,6 +23,7 @@
   import { gaffer } from '$lib/coach';
   import PitchField from '$lib/components/PitchField.svelte';
   import PlayerChip from '$lib/components/PlayerChip.svelte';
+  import RiskCards from '$lib/components/RiskCards.svelte';
   import * as Icon from '$lib/components/icons';
 
   // Guard: if no session, send home (client-only to dodge SSR goto crash)
@@ -37,8 +39,11 @@
   // Multi-drop selection — order preserved
   let dropIds: number[] = $state([]);
   // Slot-level recommendations from recommendReplacements(sellIds[])
+  let recPayload: any = $state(null);
   let recs: any[] = $state([]);                       // one entry per sell id
   let recsLoading = $state(false);
+  let horizon = $state(5);
+  const horizonOptions = [3, 5, 8];
   // Which drop slot is currently focused in the right pane
   let activeDropId: number | null = $state(null);
   // Per-slot earmarked candidate {sellId -> candidate}
@@ -46,6 +51,9 @@
   // Per-slot single-swap sim {sellId -> sim result}
   let simByPick: Record<number, any> = $state({});
   let simInFlight: Record<number, boolean> = $state({});
+  let exactPlanSim: any = $state(null);
+  let exactPlanLoading = $state(false);
+  let exactPlanRequestKey = $state('');
 
   // Manual browse mode per slot
   let browseMode = $state(false);
@@ -112,18 +120,113 @@
   let combinedBudget = $derived(
     bank + dropPlayers.reduce((s: number, p: any) => s + (p?.price ?? 0), 0)
   );
+  let enginePlanBudget = $derived(recPayload?.plan_budget ?? combinedBudget);
   let nTransfers = $derived(dropIds.length);
   let nPicks = $derived(dropIds.filter(id => picks[id]).length);
   let hitCost = $derived(Math.max(0, nTransfers - freeTransfers) * 4);
+  let transferAlerts = $derived(recPayload?.alerts ?? []);
+  let transferPlans = $derived(recPayload?.plans ?? []);
+  let planning = $derived(recPayload?.planning ?? null);
 
-  // Combined portfolio impact = sum of individual sim deltas.
-  // Approximate (correlation doesn't compose linearly) but a useful
-  // directional preview for the user.
+  function planSignature(plan: any) {
+    return (plan?.slots ?? [])
+      .map((slot: any) => `${slot.sell_id}:${slot.candidate?.id}`)
+      .sort()
+      .join('|');
+  }
+
+  function picksSignature() {
+    return dropIds
+      .filter((id) => picks[id]?.id)
+      .map((id) => `${id}:${picks[id].id}`)
+      .sort()
+      .join('|');
+  }
+
+  let activePlan = $derived.by(() => {
+    const signature = picksSignature();
+    if (!signature || !transferPlans.length) return null;
+    return transferPlans.find((plan: any) => planSignature(plan) === signature) ?? null;
+  });
+
+  function manualPlanEntries() {
+    return dropIds
+      .filter((id) => picks[id]?.id)
+      .map((id) => ({ sell_id: id, buy_id: picks[id].id }));
+  }
+
+  function candidateTakenElsewhere(candidateId: number, slotId: number | null = null) {
+    return dropIds.some((id) => id !== slotId && picks[id]?.id === candidateId);
+  }
+
+  $effect(() => {
+    const mgr = $managerId;
+    const allPicked = dropIds.length > 0 && dropIds.every((id) => picks[id]?.id);
+    const key = `${mgr ?? 'x'}:${horizon}:${dropIds.join(',')}:${dropIds.map((id) => `${id}:${picks[id]?.id ?? ''}`).join('|')}`;
+
+    if (!mgr || !allPicked || activePlan) {
+      exactPlanSim = null;
+      exactPlanLoading = false;
+      exactPlanRequestKey = '';
+      return;
+    }
+
+    if (exactPlanRequestKey === key) return;
+
+    exactPlanRequestKey = key;
+    exactPlanLoading = true;
+    const picksForSim = manualPlanEntries();
+    void simulateTransferPlan(mgr, picksForSim, horizon)
+      .then((result) => {
+        if (exactPlanRequestKey !== key) return;
+        exactPlanSim = result;
+      })
+      .catch(() => {
+        if (exactPlanRequestKey !== key) return;
+        exactPlanSim = null;
+      })
+      .finally(() => {
+        if (exactPlanRequestKey === key) exactPlanLoading = false;
+      });
+  });
+
+  // Combined portfolio impact.
+  // If the current picks match a suggested full plan, use the exact
+  // joint delta from the backend. Otherwise fall back to summed singles.
   let combinedDelta = $derived.by(() => {
+    if (activePlan) {
+      return {
+        exact: true,
+        projected: activePlan.projected_ep_gain ?? 0,
+        ep: activePlan.delta?.ep_next ?? 0,
+        std: activePlan.delta?.portfolio_std ?? 0,
+        enb: activePlan.delta?.enb ?? 0,
+        hhi: activePlan.delta?.hhi ?? 0,
+        netProjected: (activePlan.projected_ep_gain ?? 0) - hitCost,
+      };
+    }
+
+    if (exactPlanSim?.delta) {
+      return {
+        exact: true,
+        projected: exactPlanSim.projected_ep_gain ?? 0,
+        ep: exactPlanSim.delta?.ep_next ?? 0,
+        std: exactPlanSim.delta?.portfolio_std ?? 0,
+        enb: exactPlanSim.delta?.enb ?? 0,
+        hhi: exactPlanSim.delta?.hhi ?? 0,
+        netProjected: (exactPlanSim.projected_ep_gain ?? 0) - hitCost,
+      };
+    }
+
     let any = false;
-    let ep = 0, std = 0, enb = 0, hhi = 0;
+    let ep = 0, std = 0, enb = 0, hhi = 0, projected = 0;
     for (const id of dropIds) {
+      const pick = picks[id];
       const s = simByPick[id];
+      if (pick?.breakdown) {
+        any = true;
+        projected += pick.breakdown.projected_gain ?? 0;
+      }
       if (!s?.delta) continue;
       any = true;
       ep  += s.delta.ep_next ?? 0;
@@ -132,9 +235,15 @@
       hhi += s.delta.hhi ?? 0;
     }
     if (!any) return null;
-    return { ep, std, enb, hhi, netEp: ep - hitCost };
+    return { exact: false, projected, ep, std, enb, hhi, netProjected: projected - hitCost };
   });
   let combinedCorrelationChanges = $derived.by(() => {
+    if (activePlan?.correlation_changes?.length) {
+      return activePlan.correlation_changes.slice(0, 3);
+    }
+    if (exactPlanSim?.correlation_changes?.length) {
+      return exactPlanSim.correlation_changes.slice(0, 3);
+    }
     const seen = new Set<string>();
     const rows = [];
     for (const id of dropIds) {
@@ -173,14 +282,18 @@
   // ── Actions ──────────────────────────────────────────────
   async function fetchRecs(ids: number[]) {
     if (!$managerId || ids.length === 0) {
+      recPayload = null;
       recs = [];
+      exactPlanSim = null;
       return;
     }
     recsLoading = true;
     try {
-      const r = await recommendReplacements($managerId, ids, 6);
+      const r = await recommendReplacements($managerId, ids, 8, horizon);
+      recPayload = r;
       recs = r.recommendations ?? [];
     } catch (e) {
+      recPayload = null;
       recs = [];
     } finally {
       recsLoading = false;
@@ -191,26 +304,36 @@
     const idx = dropIds.indexOf(p.id);
     if (idx >= 0) {
       // Un-drop
-      dropIds = dropIds.filter(id => id !== p.id);
+      const nextDropIds = dropIds.filter(id => id !== p.id);
+      dropIds = nextDropIds;
       delete picks[p.id];
       delete simByPick[p.id];
       picks = { ...picks };
       simByPick = { ...simByPick };
-      if (activeDropId === p.id) activeDropId = dropIds[0] ?? null;
+      if (activeDropId === p.id) activeDropId = nextDropIds[0] ?? null;
       gaffer.say(`${p.web_name.toUpperCase()} BACK IN THE SQUAD.`);
+      await fetchRecs(nextDropIds);
     } else {
       // Add to drop set
-      dropIds = [...dropIds, p.id];
+      const nextDropIds = [...dropIds, p.id];
+      dropIds = nextDropIds;
       activeDropId = p.id;
       browseMode = false;
       gaffer.say(`${p.web_name.toUpperCase()} ON THE SUB BOARD.`);
+      await fetchRecs(nextDropIds);
     }
-    await fetchRecs(dropIds);
   }
 
   function focusDrop(id: number) {
     activeDropId = id;
     browseMode = false;
+  }
+
+  async function setPlanningHorizon(next: number) {
+    if (horizon === next) return;
+    horizon = next;
+    gaffer.say(`TRANSFER WINDOW SET. NEXT ${next} GAMEWEEKS.`);
+    if (dropIds.length) await fetchRecs(dropIds);
   }
 
   function historyScoreKey(row: any) {
@@ -239,6 +362,10 @@
 
   async function earmark(candidate: any) {
     if (activeDropId == null) return;
+    if (candidateTakenElsewhere(candidate.id, activeDropId)) {
+      gaffer.say(`${candidate.web_name.toUpperCase()} IS ALREADY USED IN THIS PLAN.`);
+      return;
+    }
     picks = { ...picks, [activeDropId]: candidate };
     simInFlight = { ...simInFlight, [activeDropId]: true };
     try {
@@ -258,8 +385,21 @@
     if (next != null) activeDropId = next;
   }
 
+  async function applyPlan(plan: any) {
+    const nextPicks = { ...picks };
+    for (const slot of plan?.slots ?? []) {
+      nextPicks[slot.sell_id] = slot.candidate;
+    }
+    picks = nextPicks;
+    simByPick = {};
+    gaffer.say(`PLAN LOADED. ${plan.projected_ep_gain >= 0 ? '+' : ''}${plan.projected_ep_gain?.toFixed(1) ?? '0.0'} PROJECTED.`);
+    const next = dropIds.find(id => !nextPicks[id]);
+    activeDropId = next ?? dropIds[0] ?? null;
+  }
+
   function clearPlan() {
     dropIds = [];
+    recPayload = null;
     picks = {};
     simByPick = {};
     activeDropId = null;
@@ -278,7 +418,14 @@
         sort: 'ep_next',
         limit: 40,
       });
-      browsePlayers = r.players ?? [];
+      const blockedIds = new Set<number>([
+        ...allPlayers.map((player: any) => player.id),
+        ...dropIds,
+        ...dropIds
+          .filter((id) => id !== activeDrop.id && picks[id]?.id)
+          .map((id) => picks[id].id),
+      ]);
+      browsePlayers = (r.players ?? []).filter((player: any) => !blockedIds.has(player.id));
     } finally {
       browseLoading = false;
     }
@@ -306,6 +453,14 @@
   }
 
   function isDrop(id: number) { return dropIds.includes(id); }
+
+  function planCorrTone(plan: any) {
+    const enb = plan?.delta?.enb ?? 0;
+    const hhi = plan?.delta?.hhi ?? 0;
+    if (enb > 0.2 || hhi < -0.01) return 'positive';
+    if (enb < -0.2 || hhi > 0.01) return 'negative';
+    return 'dim2';
+  }
 </script>
 
 <div class="container page-stack reveal">
@@ -314,15 +469,36 @@
       <span class="eyebrow"><Icon.Swap size={12} /> Transfer Planner</span>
       <h1>Drop as many as you need. See the joint ripple.</h1>
       <p class="dim">
-        Add players to the sub board, earmark replacements, and read the combined EP and variance shift live.
+        Add players to the sub board, let the engine rank the full move set, and work off transfer alerts before softer matrix tweaks.
       </p>
     </div>
-    <div class="bank-card">
-      <Icon.Coin size={16} />
-      <div>
-        <span class="stat-label">Combined budget</span>
-        <span class="bank-val mono">£{combinedBudget.toFixed(1)}m</span>
-        <span class="dim2 small">£{bank.toFixed(1)}m bank + {nTransfers} sell price{nTransfers === 1 ? '' : 's'}</span>
+    <div class="planner-tools">
+      <div class="bank-card">
+        <Icon.Coin size={16} />
+        <div>
+          <span class="stat-label">Combined budget</span>
+          <span class="bank-val mono">£{enginePlanBudget.toFixed(1)}m</span>
+          <span class="dim2 small">£{bank.toFixed(1)}m bank + {nTransfers} sell price{nTransfers === 1 ? '' : 's'}</span>
+        </div>
+      </div>
+      <div class="horizon-card">
+        <span class="stat-label">Planning window</span>
+        <div class="horizon-pills">
+          {#each horizonOptions as option}
+            <button
+              class="horizon-pill"
+              class:active={horizon === option}
+              onclick={() => setPlanningHorizon(option)}
+            >
+              Next {option}
+            </button>
+          {/each}
+        </div>
+        {#if planning}
+          <span class="dim2 small">
+            Engine leans {planning.recommended_horizon} GWs. GW{planning.window_start_event} to GW{planning.window_end_event}.
+          </span>
+        {/if}
       </div>
     </div>
   </header>
@@ -332,6 +508,21 @@
   {:else if xrayError}
     <p class="error-msg">{xrayError}</p>
   {:else if xray}
+    {#if dropIds.length > 0 && transferAlerts.length}
+      <section class="planner-alerts fade-in">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow"><Icon.Whistle size={12} /> Transfer alerts</span>
+            <h2>Move the squad here first</h2>
+          </div>
+          {#if planning}
+            <span class="dim2 small">{planning.recommended_reason}</span>
+          {/if}
+        </div>
+        <RiskCards callouts={transferAlerts} />
+      </section>
+    {/if}
+
     <div class="planner-grid">
       <!-- ═════ LEFT: Squad with multi-drop selection ═════ -->
       <div class="card squad-pane">
@@ -422,6 +613,46 @@
             </button>
           </div>
 
+          {#if transferPlans.length}
+            <section class="plan-ideas">
+              <div class="section-head compact">
+                <div>
+                  <span class="eyebrow"><Icon.Stopwatch size={12} /> Full-plan ideas</span>
+                  <h3>Joint moves, scored as one plan</h3>
+                </div>
+                <span class="dim2 small">Best search range: up to 6 outs</span>
+              </div>
+              <div class="plan-cards">
+                {#each transferPlans as plan, i}
+                  <button
+                    type="button"
+                    class="plan-card"
+                    class:active={activePlan && planSignature(activePlan) === planSignature(plan)}
+                    onclick={() => applyPlan(plan)}
+                  >
+                    <div class="plan-card-top">
+                      <span class="plan-rank">#{i + 1}</span>
+                      <span class="mono {plan.projected_ep_gain >= 0 ? 'positive' : 'negative'}">
+                        {sign(plan.projected_ep_gain)}
+                      </span>
+                    </div>
+                    <div class="plan-lines">
+                      {#each plan.slots as slot}
+                        <span>{slot.sell_name} → {slot.candidate.web_name}</span>
+                      {/each}
+                    </div>
+                    <div class="plan-metrics">
+                      <span class="mono">£{plan.spent?.toFixed(1)}m / £{plan.budget?.toFixed(1)}m</span>
+                      <span class="mono {planCorrTone(plan)}">ENB {sign(plan.delta?.enb ?? 0)}</span>
+                      <span class="mono {deltaClass(plan.delta?.hhi ?? 0, 'neg')}">HHI {sign(plan.delta?.hhi ?? 0)}</span>
+                    </div>
+                    <p class="dim small">{plan.summary}</p>
+                  </button>
+                {/each}
+              </div>
+            </section>
+          {/if}
+
           {#if activeDrop}
             <div class="replace-head">
               <div>
@@ -453,15 +684,21 @@
                   <p class="dim small">Loading…</p>
                 {:else}
                   {#each browsePlayers as c}
+                    {@const taken = candidateTakenElsewhere(c.id, activeDropId)}
                     <button
                       type="button"
                       class="cand-row"
                       class:active={picks[activeDropId!]?.id === c.id}
+                      class:blocked={taken}
+                      disabled={taken}
                       onclick={() => earmark(c)}
                     >
                       <div class="cand-top">
                         <span class="cand-name">{c.web_name}</span>
                         <span class="badge badge-accent">{c.team_short}</span>
+                        {#if taken}
+                          <span class="cand-flag">Used elsewhere</span>
+                        {/if}
                       </div>
                       <div class="cand-meta">
                         <span class="mono">£{c.price?.toFixed(1)}m</span>
@@ -482,10 +719,13 @@
               {:else}
                 <div class="cand-list scroll">
                   {#each activeRec.candidates as c, i}
+                    {@const taken = candidateTakenElsewhere(c.id, activeDropId)}
                     <button
                       type="button"
                       class="cand-row"
                       class:active={picks[activeDropId!]?.id === c.id}
+                      class:blocked={taken}
+                      disabled={taken}
                       onclick={() => earmark(c)}
                     >
                       <div class="cand-rank">#{i + 1}</div>
@@ -493,6 +733,12 @@
                         <div class="cand-top">
                           <span class="cand-name">{c.web_name}</span>
                           <span class="badge badge-accent">{c.team_short}</span>
+                          {#if c.requires_plan_budget}
+                            <span class="cand-flag">Needs funding</span>
+                          {/if}
+                          {#if taken}
+                            <span class="cand-flag">Used elsewhere</span>
+                          {/if}
                           {#if c.score != null}<span class="cand-score mono">{c.score?.toFixed(2)}</span>{/if}
                         </div>
                         <div class="cand-meta">
@@ -502,13 +748,17 @@
                           <span class="dim2">·</span>
                           <span class="mono accent">{c.ep_next?.toFixed(1) ?? '—'} EP</span>
                           <span class="dim2">·</span>
+                          <span class="mono {c.breakdown?.projected_gain > 0 ? 'positive' : c.breakdown?.projected_gain < 0 ? 'negative' : ''}">
+                            {sign(c.breakdown?.projected_gain ?? 0)} proj
+                          </span>
+                          <span class="dim2">·</span>
                           <span class="mono">{c.form?.toFixed(1)} form</span>
                         </div>
                         {#if c.fixture_strip?.length}
                           <div class="cand-fixtures">
                             {#each c.fixture_strip.slice(0, 5) as f}
                               <span class="fx fdr-{f.difficulty}">
-                                {f.is_home ? '' : '@'}GW{f.event}
+                                {f.is_home ? '' : '@'}{f.opponent} GW{f.event}
                               </span>
                             {/each}
                           </div>
@@ -533,6 +783,13 @@
             <h2>
               {nPicks} of {nTransfers} slot{nTransfers === 1 ? '' : 's'} earmarked
             </h2>
+            {#if activePlan}
+              <span class="dim2 small">Exact joint delta from the loaded suggestion.</span>
+            {:else if exactPlanSim}
+              <span class="dim2 small">Exact joint delta from your current manual plan.</span>
+            {:else if exactPlanLoading}
+              <span class="dim2 small">Calculating exact joint delta…</span>
+            {/if}
           </div>
           <div class="ps-ft">
             <label class="ps-ft-label">
@@ -555,7 +812,13 @@
           <div class="ps-body">
             <div class="ps-deltas">
               <div class="ps-cell">
-                <span class="stat-label">ΔExpected pts</span>
+                <span class="stat-label">Projected gain</span>
+                <span class="mono {deltaClass(combinedDelta.projected, 'pos')}">
+                  {sign(combinedDelta.projected)}
+                </span>
+              </div>
+              <div class="ps-cell">
+                <span class="stat-label">ΔNext GW EP</span>
                 <span class="mono {deltaClass(combinedDelta.ep, 'pos')}">
                   {sign(combinedDelta.ep)}
                 </span>
@@ -579,9 +842,9 @@
                 </span>
               </div>
               <div class="ps-cell ps-net">
-                <span class="stat-label">Net EP (after hits)</span>
-                <span class="mono {deltaClass(combinedDelta.netEp, 'pos')}">
-                  {sign(combinedDelta.netEp)}
+                <span class="stat-label">Net projected (after hits)</span>
+                <span class="mono {deltaClass(combinedDelta.netProjected, 'pos')}">
+                  {sign(combinedDelta.netProjected)}
                 </span>
               </div>
             </div>
@@ -602,11 +865,15 @@
           </div>
 
           <p class="ps-note dim">
-            Deltas are summed from per-slot sims. Read them directionally, then confirm the final move set in FPL.
+            {#if combinedDelta.exact}
+              This is the exact joint read for the full move set. Use it to judge the whole plan, not one slot at a time.
+            {:else}
+              Projected gain is summed from slot-level reads. Load one of the suggested plans above for the exact joint delta.
+            {/if}
           </p>
         {:else}
           <p class="dim small">
-            Earmark a candidate and the combined deltas will appear here.
+            Earmark a candidate or load a suggested plan and the combined deltas will appear here.
           </p>
         {/if}
       </section>
@@ -716,6 +983,12 @@
     font-size: 0.86rem;
     line-height: 1.5;
   }
+  .planner-tools {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 0.75rem;
+  }
   .bank-card {
     display: flex;
     align-items: center;
@@ -739,6 +1012,55 @@
     letter-spacing: -0.03em;
     color: var(--text-heading);
     line-height: 1;
+  }
+  .horizon-card {
+    min-width: 220px;
+    padding: 0.8rem 1rem;
+    background: color-mix(in srgb, var(--bg-card) 90%, transparent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .horizon-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+  .horizon-pill {
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+    color: var(--text-secondary);
+    border-radius: 999px;
+    padding: 0.28rem 0.6rem;
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    cursor: pointer;
+  }
+  .horizon-pill.active {
+    color: var(--accent-text);
+    border-color: var(--border-accent);
+    background: var(--accent-soft);
+  }
+  .planner-alerts {
+    margin-bottom: 0.9rem;
+  }
+  .section-head {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 0.75rem;
+    margin-bottom: 0.7rem;
+    flex-wrap: wrap;
+  }
+  .section-head h2,
+  .section-head h3 {
+    margin: 0.18rem 0 0;
+    line-height: 1.05;
+  }
+  .section-head.compact {
+    margin-bottom: 0.55rem;
   }
 
   .loading-state { display: flex; align-items: center; gap: 1rem; padding: 3rem 0; justify-content: center; }
@@ -866,6 +1188,60 @@
     letter-spacing: -0.02em;
     margin: 0.2rem 0 0.15rem;
   }
+  .plan-ideas {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px dashed var(--border);
+  }
+  .plan-cards {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.5rem;
+  }
+  .plan-card {
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+    text-align: left;
+    padding: 0.75rem 0.85rem;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+    cursor: pointer;
+  }
+  .plan-card:hover,
+  .plan-card.active {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .plan-card-top {
+    display: flex;
+    justify-content: space-between;
+    gap: 0.75rem;
+    align-items: center;
+  }
+  .plan-rank {
+    font-family: var(--heading);
+    font-size: 1.15rem;
+    font-weight: 800;
+    color: var(--accent-text);
+  }
+  .plan-lines {
+    display: flex;
+    flex-direction: column;
+    gap: 0.18rem;
+    color: var(--text-heading);
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+  .plan-metrics {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.45rem;
+    font-size: 0.68rem;
+  }
 
   .browse-controls {
     display: flex;
@@ -900,6 +1276,16 @@
   .cand-row.active {
     border-color: var(--accent);
     background: var(--accent-soft);
+  }
+  .cand-row:disabled,
+  .cand-row.blocked {
+    cursor: not-allowed;
+    opacity: 0.62;
+  }
+  .cand-row:disabled:hover,
+  .cand-row.blocked:hover {
+    border-color: var(--border);
+    background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
   }
   .cand-rank {
     font-family: var(--heading);
@@ -936,6 +1322,19 @@
     padding: 0.1rem 0.4rem;
     border-radius: 100px;
     border: 1px solid var(--border-accent);
+  }
+  .cand-flag {
+    display: inline-flex;
+    align-items: center;
+    padding: 0.12rem 0.42rem;
+    border-radius: 999px;
+    background: color-mix(in srgb, var(--yellow) 15%, transparent);
+    border: 1px solid color-mix(in srgb, var(--yellow) 30%, var(--border));
+    color: var(--yellow);
+    font-size: 0.58rem;
+    font-family: var(--mono);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
   .cand-meta {
     display: flex;
@@ -1082,7 +1481,7 @@
 
   .ps-deltas {
     display: grid;
-    grid-template-columns: repeat(5, 1fr);
+    grid-template-columns: repeat(6, 1fr);
     gap: 0.55rem;
   }
   .ps-body {
@@ -1234,6 +1633,8 @@
   @media (max-width: 980px) {
     .planner-grid { grid-template-columns: 1fr; }
     .planner-head h1 { font-size: 1.8rem; }
+    .planner-tools { width: 100%; }
+    .bank-card, .horizon-card { width: 100%; }
     .ps-body { grid-template-columns: 1fr; }
     .ps-deltas { grid-template-columns: repeat(2, 1fr); }
     .history-scorecard { grid-template-columns: 1fr; }
