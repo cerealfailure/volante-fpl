@@ -31,5 +31,5 @@ cd "$ROOT_DIR/server"
 export PYTHONUNBUFFERED=1
 
 exec "$PYTHON_BIN" -m uvicorn main:app \
-  --host "${VOLANTE_API_HOST:-0.0.0.0}" \
+  --host "${VOLANTE_API_HOST:-127.0.0.1}" \
   --port "${VOLANTE_API_PORT:-8555}"

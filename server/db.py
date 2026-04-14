@@ -260,6 +260,71 @@ CREATE TABLE IF NOT EXISTS live_gw_cache (
     PRIMARY KEY (event, player_id)
 );
 
+CREATE TABLE IF NOT EXISTS signal_sources (
+    key             TEXT PRIMARY KEY,
+    label           TEXT NOT NULL,
+    source_type     TEXT NOT NULL,
+    weight          REAL DEFAULT 1.0,
+    enabled         INTEGER DEFAULT 1,
+    meta            TEXT,
+    updated_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS projection_snapshots (
+    source_key          TEXT REFERENCES signal_sources(key),
+    snapshot_at         TEXT NOT NULL,
+    event               INTEGER NOT NULL,
+    horizon             INTEGER DEFAULT 5,
+    player_id           INTEGER REFERENCES players(id),
+    expected_points     REAL,
+    xg                  REAL,
+    xa                  REAL,
+    xgi                 REAL,
+    expected_minutes    REAL,
+    selected_pct        REAL,
+    anytime_return_prob REAL,
+    clean_sheet_prob    REAL,
+    raw                 TEXT,
+    PRIMARY KEY (source_key, snapshot_at, event, horizon, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS intel_runs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    manager_id      INTEGER NOT NULL,
+    event           INTEGER NOT NULL,
+    horizon         INTEGER NOT NULL,
+    created_at      TEXT NOT NULL,
+    model_version   TEXT,
+    summary         TEXT
+);
+
+CREATE TABLE IF NOT EXISTS intel_alerts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id          INTEGER REFERENCES intel_runs(id),
+    manager_id      INTEGER NOT NULL,
+    event           INTEGER NOT NULL,
+    horizon         INTEGER NOT NULL,
+    category        TEXT NOT NULL,
+    severity        TEXT NOT NULL,
+    title           TEXT NOT NULL,
+    detail          TEXT NOT NULL,
+    score           REAL DEFAULT 0,
+    dedupe_key      TEXT NOT NULL,
+    payload         TEXT,
+    created_at      TEXT NOT NULL,
+    delivery_status TEXT DEFAULT 'pending',
+    delivered_at    TEXT,
+    UNIQUE(manager_id, event, dedupe_key)
+);
+
+CREATE TABLE IF NOT EXISTS alert_delivery_targets (
+    name            TEXT PRIMARY KEY,
+    target_type     TEXT NOT NULL,
+    enabled         INTEGER DEFAULT 1,
+    config          TEXT,
+    updated_at      TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_player_gws_player ON player_gws(player_id);
 CREATE INDEX IF NOT EXISTS idx_player_gws_event ON player_gws(event);
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
@@ -269,6 +334,9 @@ CREATE INDEX IF NOT EXISTS idx_manager_leagues_mgr ON manager_leagues(manager_id
 CREATE INDEX IF NOT EXISTS idx_league_pages_league ON league_pages(league_id, page);
 CREATE INDEX IF NOT EXISTS idx_league_standings_league ON league_standings(league_id, page, rank_sort);
 CREATE INDEX IF NOT EXISTS idx_manager_transfers_mgr ON manager_transfers(manager_id, time);
+CREATE INDEX IF NOT EXISTS idx_projection_snapshots_lookup ON projection_snapshots(event, horizon, player_id, source_key, snapshot_at);
+CREATE INDEX IF NOT EXISTS idx_intel_runs_mgr ON intel_runs(manager_id, event, created_at);
+CREATE INDEX IF NOT EXISTS idx_intel_alerts_mgr ON intel_alerts(manager_id, event, delivery_status, created_at);
 """
 
 
@@ -833,7 +901,258 @@ async def get_event_fixtures(conn: aiosqlite.Connection, event: int) -> list[dic
     return [dict(r) for r in rows]
 
 
+# ── Intelligence layer ──────────────────────────────────────────────
+
+async def upsert_signal_source(
+    conn: aiosqlite.Connection,
+    key: str,
+    label: str,
+    source_type: str,
+    weight: float = 1.0,
+    enabled: bool = True,
+    meta: dict | None = None,
+):
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute("""
+        INSERT INTO signal_sources (key, label, source_type, weight, enabled, meta, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            label=excluded.label,
+            source_type=excluded.source_type,
+            weight=excluded.weight,
+            enabled=excluded.enabled,
+            meta=excluded.meta,
+            updated_at=excluded.updated_at
+    """, (key, label, source_type, weight, 1 if enabled else 0, _json_dump(meta), now))
+
+
+async def get_signal_sources(conn: aiosqlite.Connection, enabled_only: bool = True) -> list[dict]:
+    where = "WHERE enabled=1" if enabled_only else ""
+    rows = await conn.execute_fetchall(f"""
+        SELECT * FROM signal_sources
+        {where}
+        ORDER BY enabled DESC, weight DESC, key
+    """)
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["enabled"] = bool(item.get("enabled"))
+        if item.get("meta"):
+            item["meta"] = json.loads(item["meta"])
+        result.append(item)
+    return result
+
+
+async def upsert_projection_snapshot(
+    conn: aiosqlite.Connection,
+    source_key: str,
+    snapshot_at: str,
+    event: int,
+    horizon: int,
+    rows: list[dict],
+):
+    await conn.executemany("""
+        INSERT OR REPLACE INTO projection_snapshots
+        (source_key, snapshot_at, event, horizon, player_id, expected_points,
+         xg, xa, xgi, expected_minutes, selected_pct, anytime_return_prob,
+         clean_sheet_prob, raw)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [(
+        source_key,
+        snapshot_at,
+        event,
+        horizon,
+        row["player_id"],
+        row.get("expected_points"),
+        row.get("xg"),
+        row.get("xa"),
+        row.get("xgi"),
+        row.get("expected_minutes"),
+        row.get("selected_pct"),
+        row.get("anytime_return_prob"),
+        row.get("clean_sheet_prob"),
+        _json_dump(row.get("raw")),
+    ) for row in rows])
+
+
+async def get_latest_projection_rows(
+    conn: aiosqlite.Connection,
+    event: int,
+    horizon: int,
+    player_ids: list[int] | None = None,
+) -> list[dict]:
+    params: list = [event, horizon]
+    filter_sql = ""
+    if player_ids:
+        placeholders = ",".join("?" * len(player_ids))
+        filter_sql = f" AND player_id IN ({placeholders})"
+        params.extend(player_ids)
+
+    rows = await conn.execute_fetchall(f"""
+        SELECT *
+        FROM projection_snapshots
+        WHERE event=? AND horizon=? {filter_sql}
+        ORDER BY source_key, snapshot_at DESC
+    """, params)
+
+    latest_cutoff: dict[str, str] = {}
+    result = []
+    for row in rows:
+        item = dict(row)
+        source_key = item["source_key"]
+        snapshot_at = item["snapshot_at"]
+        if source_key not in latest_cutoff:
+            latest_cutoff[source_key] = snapshot_at
+        if latest_cutoff[source_key] != snapshot_at:
+            continue
+        if item.get("raw"):
+            item["raw"] = json.loads(item["raw"])
+        result.append(item)
+    return result
+
+
+async def insert_intel_run(
+    conn: aiosqlite.Connection,
+    manager_id: int,
+    event: int,
+    horizon: int,
+    summary: dict,
+    model_version: str = "transfer-intel-v1",
+) -> int:
+    now = datetime.now(timezone.utc).isoformat()
+    cur = await conn.execute("""
+        INSERT INTO intel_runs (manager_id, event, horizon, created_at, model_version, summary)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (manager_id, event, horizon, now, model_version, _json_dump(summary)))
+    return cur.lastrowid
+
+
+async def upsert_intel_alerts(conn: aiosqlite.Connection, alerts: list[dict]):
+    if not alerts:
+        return
+    await conn.executemany("""
+        INSERT INTO intel_alerts
+        (run_id, manager_id, event, horizon, category, severity, title, detail,
+         score, dedupe_key, payload, created_at, delivery_status, delivered_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', NULL)
+        ON CONFLICT(manager_id, event, dedupe_key) DO UPDATE SET
+            run_id=excluded.run_id,
+            horizon=excluded.horizon,
+            category=excluded.category,
+            severity=excluded.severity,
+            title=excluded.title,
+            detail=excluded.detail,
+            score=excluded.score,
+            payload=excluded.payload,
+            created_at=excluded.created_at,
+            delivery_status='pending',
+            delivered_at=NULL
+        WHERE intel_alerts.title <> excluded.title
+           OR intel_alerts.detail <> excluded.detail
+           OR intel_alerts.severity <> excluded.severity
+           OR ABS(COALESCE(intel_alerts.score, 0) - COALESCE(excluded.score, 0)) > 0.01
+           OR COALESCE(intel_alerts.payload, '') <> COALESCE(excluded.payload, '')
+    """, [(
+        alert.get("run_id"),
+        alert["manager_id"],
+        alert["event"],
+        alert["horizon"],
+        alert["category"],
+        alert["severity"],
+        alert["title"],
+        alert["detail"],
+        alert.get("score", 0),
+        alert["dedupe_key"],
+        _json_dump(alert.get("payload")),
+        alert.get("created_at") or datetime.now(timezone.utc).isoformat(),
+    ) for alert in alerts])
+
+
+async def get_intel_alerts(
+    conn: aiosqlite.Connection,
+    manager_id: int,
+    delivery_status: str | None = None,
+    limit: int = 50,
+) -> list[dict]:
+    params: list = [manager_id]
+    where = "WHERE manager_id=?"
+    if delivery_status is not None:
+        where += " AND delivery_status=?"
+        params.append(delivery_status)
+    params.append(limit)
+    rows = await conn.execute_fetchall(f"""
+        SELECT *
+        FROM intel_alerts
+        {where}
+        ORDER BY created_at DESC, score DESC
+        LIMIT ?
+    """, params)
+    result = []
+    for row in rows:
+        item = dict(row)
+        if item.get("payload"):
+            item["payload"] = json.loads(item["payload"])
+        result.append(item)
+    return result
+
+
+async def mark_intel_alert_delivered(
+    conn: aiosqlite.Connection,
+    alert_id: int,
+    status: str = "delivered",
+):
+    delivered_at = datetime.now(timezone.utc).isoformat()
+    await conn.execute("""
+        UPDATE intel_alerts
+        SET delivery_status=?, delivered_at=?
+        WHERE id=?
+    """, (status, delivered_at, alert_id))
+
+
+async def upsert_alert_delivery_target(
+    conn: aiosqlite.Connection,
+    name: str,
+    target_type: str,
+    enabled: bool = True,
+    config: dict | None = None,
+):
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute("""
+        INSERT INTO alert_delivery_targets (name, target_type, enabled, config, updated_at)
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(name) DO UPDATE SET
+            target_type=excluded.target_type,
+            enabled=excluded.enabled,
+            config=excluded.config,
+            updated_at=excluded.updated_at
+    """, (name, target_type, 1 if enabled else 0, _json_dump(config), now))
+
+
+async def get_alert_delivery_targets(conn: aiosqlite.Connection, enabled_only: bool = True) -> list[dict]:
+    where = "WHERE enabled=1" if enabled_only else ""
+    rows = await conn.execute_fetchall(f"""
+        SELECT *
+        FROM alert_delivery_targets
+        {where}
+        ORDER BY enabled DESC, name
+    """)
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["enabled"] = bool(item.get("enabled"))
+        if item.get("config"):
+            item["config"] = json.loads(item["config"])
+        result.append(item)
+    return result
+
+
 from datetime import datetime, timezone
+
+
+def _json_dump(value) -> str | None:
+    if value is None:
+        return None
+    return json.dumps(value, sort_keys=True)
 
 
 def _float(v) -> float | None:

@@ -49,6 +49,17 @@ export const simulateTransfer = (mgr: number, out: number, inn: number) =>
     method: 'POST', body: JSON.stringify({ player_out: out, player_in: inn }),
   });
 
+export const simulateTransferPlan = (
+  mgr: number,
+  picks: Array<{ sell_id: number; buy_id: number }>,
+  horizon = 5,
+  event?: number,
+) =>
+  request(`/api/xray/${mgr}/simulate-plan`, {
+    method: 'POST',
+    body: JSON.stringify({ picks, horizon, event }),
+  });
+
 export const getPlayers = (params: Record<string, unknown> = {}) =>
   request(withQuery('/api/players', params));
 
@@ -62,9 +73,9 @@ export const getStatus = (managerId?: number) =>
   request(withQuery('/api/status', { manager_id: managerId }));
 
 // ── Transfer Lab ─────────────────────────────────────────────────────
-export const recommendReplacements = (mgr: number, sellIds: number[], n = 5) =>
+export const recommendReplacements = (mgr: number, sellIds: number[], n = 5, horizon = 5) =>
   request(`/api/xray/${mgr}/recommend`, {
-    method: 'POST', body: JSON.stringify({ sell_ids: sellIds, n }),
+    method: 'POST', body: JSON.stringify({ sell_ids: sellIds, n, horizon }),
   });
 export const getTransferAnalysis = (id: number) => request(`/api/manager/${id}/transfer-analysis`);
 

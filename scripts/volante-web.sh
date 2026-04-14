@@ -12,6 +12,6 @@ export PATH="$(dirname "$NPM_BIN"):/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sb
 cd "$ROOT_DIR/app"
 
 exec "$NPM_BIN" run dev -- \
-  --host "${VOLANTE_WEB_HOST:-0.0.0.0}" \
+  --host "${VOLANTE_WEB_HOST:-127.0.0.1}" \
   --port "${VOLANTE_WEB_PORT:-5555}" \
   --strictPort

@@ -1,15 +1,19 @@
 """
 Transfer recommendation engine — smart replacement suggestions.
 
-When you sell a player, this ranks every affordable replacement using
-a composite score: EP delta, fixture run, form trend, xGI, correlation
-impact, set piece duties, minutes confidence, price momentum.
+The planner is horizon-aware and treats a transfer plan as a joint
+allocation problem, not a set of isolated 1-for-1 swaps:
+  - never offers selected outgoing players back as buys
+  - expands slot pools so premium targets can be funded elsewhere
+  - searches the full transfer set (practically tuned up to 6 outs)
+  - scores plans on projected points, fixture swing, xGI, budget use,
+    and actual combined correlation / exposure impact
 
 Also scores past transfers retroactively and detects bad habits.
 """
 
 import numpy as np
-from collections import defaultdict
+from collections import Counter, defaultdict
 import db
 import analysis
 import fpl
@@ -19,7 +23,746 @@ import fpl
 ATK_MULT = {1: 1.18, 2: 1.15, 3: 1.00, 4: 0.86, 5: 0.72}
 DEF_MULT = {1: 1.15, 2: 1.10, 3: 1.00, 4: 0.90, 5: 0.80}
 DECAY = 0.85  # per-GW decay for projections
-HORIZON = 5   # default look-ahead GWs
+DEFAULT_HORIZON = 5
+SUPPORTED_HORIZONS = (3, 5, 8)
+MAX_PLAN_POOL = 16
+MAX_PLAN_RESULTS = 5
+MAX_BEAM_WIDTH = 120
+MAX_EXACT_PLAN_EVALS = 24
+
+
+def _normalize_horizon(horizon: int | None) -> int:
+    if horizon is None:
+        return DEFAULT_HORIZON
+    horizon = max(1, min(8, int(horizon)))
+    if horizon in SUPPORTED_HORIZONS:
+        return horizon
+    return min(SUPPORTED_HORIZONS, key=lambda option: abs(option - horizon))
+
+
+def _player_price(player: dict) -> float:
+    if player.get("price") is not None:
+        return float(player["price"])
+    return ((player.get("now_cost") or 0) / 10.0)
+
+
+def _player_position(player: dict) -> int:
+    return int(player.get("position") or player.get("pos_type") or 0)
+
+
+def _player_xgi_per90(player: dict) -> float:
+    if player.get("xgi_per90") is not None:
+        return float(player["xgi_per90"])
+    minutes = max(player.get("minutes") or 1, 1)
+    return float((player.get("xgi") or 0) / minutes * 90)
+
+
+def _minutes_factor(player: dict, event: int | None) -> float:
+    chance = player.get("chance_next")
+    chance_factor = 1.0 if chance is None else max(0.35, min(1.0, chance / 100))
+    possible_gws = max(min(event or 1, 38), 1)
+    starts = player.get("starts") or 0
+    start_rate = min(max(starts / possible_gws, 0), 1)
+    start_factor = 0.72 + 0.33 * start_rate
+    return chance_factor * start_factor
+
+
+def _projection_base(player: dict, event: int | None) -> float:
+    base = player.get("ep_next")
+    if base is None or base <= 0:
+        base = player.get("points_per_game")
+    if base is None or base <= 0:
+        base = player.get("form")
+    if base is None or base <= 0:
+        base = 2.0
+
+    pos = _player_position(player)
+    xgi_per90 = _player_xgi_per90(player)
+    if pos in (3, 4):
+        underlying = 1.6 + xgi_per90 * 2.1
+        base = 0.72 * float(base) + 0.28 * underlying
+    elif pos in (1, 2):
+        xgc_per90 = player.get("xgc_per90")
+        defensive_floor = 2.5 if xgc_per90 is None else max(1.8, 3.1 - float(xgc_per90))
+        base = 0.75 * float(base) + 0.25 * defensive_floor
+
+    return max(float(base), 0.5)
+
+
+def _project_player_ep(player: dict, fixtures_by_team: dict[int, list[dict]], horizon: int, event: int | None) -> float:
+    fixtures = fixtures_by_team.get(player["team_id"], [])[:horizon]
+    base = _projection_base(player, event)
+    mult_map = DEF_MULT if _player_position(player) in (1, 2) else ATK_MULT
+    total = 0.0
+
+    for i, fixture in enumerate(fixtures):
+        is_home = fixture["team_h"] == player["team_id"]
+        difficulty = (fixture["team_a_difficulty"] if is_home else fixture["team_h_difficulty"]) or 3
+        total += base * mult_map.get(difficulty, 1.0) * (DECAY ** i)
+
+    if not fixtures:
+        total = base
+
+    return total * _minutes_factor(player, event)
+
+
+def _fixture_run_score(fixtures: list[dict], team_id: int, is_def: bool) -> float:
+    """Score a fixture run: positive = easy, negative = hard."""
+    if not fixtures:
+        return 0.0
+    mult = DEF_MULT if is_def else ATK_MULT
+    total = 0.0
+    for i, fixture in enumerate(fixtures):
+        is_home = fixture["team_h"] == team_id
+        difficulty = fixture["team_a_difficulty"] if is_home else fixture["team_h_difficulty"]
+        difficulty = difficulty or 3
+        total += (mult.get(difficulty, 1.0) - 1.0) * (DECAY ** i)
+    return total * 10
+
+
+def _build_fixture_strip(
+    player: dict,
+    fixtures_by_team: dict[int, list[dict]],
+    team_lookup: dict[int, dict],
+    horizon: int,
+) -> list[dict]:
+    strip = []
+    for fixture in fixtures_by_team.get(player["team_id"], [])[:horizon]:
+        is_home = fixture["team_h"] == player["team_id"]
+        opp_id = fixture["team_a"] if is_home else fixture["team_h"]
+        opp = team_lookup.get(opp_id, {})
+        strip.append({
+            "event": fixture.get("event"),
+            "difficulty": (fixture["team_a_difficulty"] if is_home else fixture["team_h_difficulty"]) or 3,
+            "is_home": is_home,
+            "opponent": opp.get("short_name", "???"),
+        })
+    return strip
+
+
+def _score_candidate(
+    candidate: dict,
+    sell_player: dict,
+    fixtures_by_team: dict[int, list[dict]],
+    event: int,
+    base_team_counts: dict[int, int],
+    horizon: int,
+) -> tuple[float, dict]:
+    """Composite transfer score with horizon-aware breakdown."""
+    pos = _player_position(candidate)
+    is_def = pos in (1, 2)
+
+    ep_in = candidate.get("ep_next") or 0
+    ep_out = sell_player.get("ep_next") or 0
+    ep_delta = float(ep_in) - float(ep_out)
+
+    projected_in = _project_player_ep(candidate, fixtures_by_team, horizon, event)
+    projected_out = _project_player_ep(sell_player, fixtures_by_team, horizon, event)
+    projected_gain = projected_in - projected_out
+
+    fix_in = fixtures_by_team.get(candidate["team_id"], [])[:horizon]
+    fix_out = fixtures_by_team.get(sell_player["team_id"], [])[:horizon]
+    fixture_delta = _fixture_run_score(fix_in, candidate["team_id"], is_def) - _fixture_run_score(
+        fix_out, sell_player["team_id"], is_def
+    )
+
+    form_delta = float(candidate.get("form") or 0) - float(sell_player.get("form") or 0)
+    xgi_delta = _player_xgi_per90(candidate) - _player_xgi_per90(sell_player)
+
+    team_count = base_team_counts.get(candidate["team_id"], 0)
+    diversification = 0.9 if team_count == 0 else (0.25 if team_count == 1 else -0.65)
+    team_fixture_pressure = _fixture_run_score(fix_in, candidate["team_id"], is_def)
+    if team_count >= 1 and team_fixture_pressure < 0:
+        diversification += team_fixture_pressure / 12.0
+
+    set_piece_bonus = 0.0
+    if candidate.get("penalties_order") and candidate["penalties_order"] <= 2:
+        set_piece_bonus += 1.8
+    if candidate.get("corners_order") and candidate["corners_order"] <= 2:
+        set_piece_bonus += 0.45
+
+    minutes_score = (_minutes_factor(candidate, event) - _minutes_factor(sell_player, event)) * 4.0
+
+    score = (
+        projected_gain * 1.45
+        + ep_delta * 0.55
+        + fixture_delta * 0.28
+        + form_delta * 0.24
+        + xgi_delta * 2.2
+        + diversification * 0.75
+        + set_piece_bonus * 0.35
+        + minutes_score * 0.45
+    )
+
+    breakdown = {
+        "projected_gain": round(projected_gain, 2),
+        "ep_delta": round(ep_delta, 2),
+        "fixture_run": round(fixture_delta, 2),
+        "form_trend": round(form_delta, 2),
+        "xgi_per90_delta": round(xgi_delta, 2),
+        "diversification": round(diversification, 2),
+        "set_pieces": round(set_piece_bonus, 2),
+        "minutes_confidence": round(minutes_score, 2),
+    }
+    return score, breakdown
+
+
+def _build_candidate_record(
+    candidate: dict,
+    sell_player: dict,
+    fixtures_by_team: dict[int, list[dict]],
+    team_lookup: dict[int, dict],
+    event: int,
+    base_team_counts: dict[int, int],
+    horizon: int,
+    slot_budget: float,
+) -> dict:
+    score, breakdown = _score_candidate(
+        candidate,
+        sell_player,
+        fixtures_by_team,
+        event,
+        base_team_counts,
+        horizon,
+    )
+    projected_ep = _project_player_ep(candidate, fixtures_by_team, horizon, event)
+    price = _player_price(candidate)
+    return {
+        "id": candidate["id"],
+        "player_id": candidate["id"],
+        "web_name": candidate["web_name"],
+        "team_id": candidate["team_id"],
+        "team_short": candidate.get("team_short", "???"),
+        "team_name": candidate.get("team_name", "???"),
+        "price": round(price, 1),
+        "total_points": candidate.get("total_points", 0),
+        "form": candidate.get("form"),
+        "ep_next": candidate.get("ep_next"),
+        "projected_ep": round(projected_ep, 1),
+        "xgi": candidate.get("xgi"),
+        "xgi_per90": round(_player_xgi_per90(candidate), 2),
+        "selected_pct": candidate.get("selected_pct"),
+        "starts": candidate.get("starts", 0),
+        "minutes": candidate.get("minutes", 0),
+        "goals": candidate.get("goals_scored", 0),
+        "assists": candidate.get("assists", 0),
+        "clean_sheets": candidate.get("clean_sheets", 0),
+        "penalties_order": candidate.get("penalties_order"),
+        "corners_order": candidate.get("corners_order"),
+        "score": round(score, 2),
+        "breakdown": breakdown,
+        "fixture_strip": _build_fixture_strip(candidate, fixtures_by_team, team_lookup, horizon),
+        "requires_plan_budget": price > slot_budget + 1e-9,
+        "over_slot_budget": round(max(0.0, price - slot_budget), 1),
+    }
+
+
+def _candidate_is_eligible(candidate: dict, keep_player_ids: set[int], removed_player_ids: set[int], base_team_counts: dict[int, int], pos: int) -> bool:
+    if candidate["id"] in keep_player_ids:
+        return False
+    if candidate["id"] in removed_player_ids:
+        return False
+    if _player_position(candidate) != pos:
+        return False
+    if base_team_counts.get(candidate["team_id"], 0) >= 3:
+        return False
+    if candidate.get("chance_next") is not None and candidate["chance_next"] < 50:
+        return False
+    return True
+
+
+def _build_plan_pool(candidates: list[dict]) -> list[dict]:
+    if len(candidates) <= MAX_PLAN_POOL:
+        return candidates
+
+    chosen = []
+    seen = set()
+    buckets = [
+        candidates[:10],
+        sorted(candidates, key=lambda row: row["projected_ep"], reverse=True)[:6],
+        sorted(candidates, key=lambda row: row["breakdown"]["projected_gain"], reverse=True)[:6],
+        sorted(candidates, key=lambda row: row["price"])[:4],
+    ]
+
+    for bucket in buckets:
+        for row in bucket:
+            if row["id"] in seen:
+                continue
+            chosen.append(row)
+            seen.add(row["id"])
+            if len(chosen) >= MAX_PLAN_POOL:
+                return chosen
+
+    return chosen[:MAX_PLAN_POOL]
+
+
+def _recommended_horizon(
+    squad: list[dict],
+    sell_players: list[dict],
+    fixtures_by_team: dict[int, list[dict]],
+) -> tuple[int, str]:
+    flagged = [player for player in squad if player.get("status") not in (None, "a") or (player.get("chance_next") is not None and player["chance_next"] < 75)]
+    if flagged:
+        return 3, "Flags or minutes risk make the next 3 GWs the cleanest decision window."
+
+    team_groups = defaultdict(list)
+    for player in squad:
+        team_groups[player["team_id"]].append(player)
+
+    sharp_turn = None
+    for players in team_groups.values():
+        if len(players) < 2:
+            continue
+        total = 0.0
+        for player in players:
+            total += _fixture_run_score(
+                fixtures_by_team.get(player["team_id"], [])[:3],
+                player["team_id"],
+                player.get("pos_type") in (1, 2),
+            )
+        if sharp_turn is None or total < sharp_turn:
+            sharp_turn = total
+
+    if sharp_turn is not None and sharp_turn < -5:
+        return 3, "A concentrated fixture turn hits quickly, so short-run planning matters most."
+    if len(sell_players) >= 4:
+        return 5, "A broader reshuffle usually pays best over 5 GWs before the forecast gets noisier."
+    return 5, "Most transfer edge sits in the next 5 GWs before fixture uncertainty compounds."
+
+
+def _build_transfer_alerts(
+    squad: list[dict],
+    sell_players: list[dict],
+    recommendations: list[dict],
+    fixtures_by_team: dict[int, list[dict]],
+    horizon: int,
+    planning_reason: str,
+) -> list[dict]:
+    alerts = []
+    sell_ids = {player["player_id"] for player in sell_players}
+    by_team = defaultdict(list)
+    for player in squad:
+        by_team[player["team_id"]].append(player)
+
+    top_slot = None
+    best_gain = -999.0
+    for row in recommendations:
+        if row.get("error") or not row.get("candidates"):
+            continue
+        gain = row["candidates"][0]["breakdown"]["projected_gain"]
+        if gain > best_gain:
+            best_gain = gain
+            top_slot = row
+    if top_slot and best_gain >= 1.5:
+        best_pick = top_slot["candidates"][0]
+        alerts.append({
+            "priority": 100,
+            "severity": "high" if best_gain >= 3 else "medium",
+            "title": f"{top_slot['sell_name']} is the cleanest exit",
+            "detail": (
+                f"{best_pick['web_name']} projects {best_gain:+.1f} points better over the next {horizon} GWs. "
+                f"{'This move needs funding from the wider plan.' if best_pick['requires_plan_budget'] else 'It fits cleanly on its own.'}"
+            ),
+        })
+
+    flagged = [
+        player for player in squad
+        if player["player_id"] in sell_ids and (
+            player.get("status") not in (None, "a")
+            or (player.get("chance_next") is not None and player["chance_next"] < 75)
+        )
+    ]
+    flagged.sort(key=lambda player: player.get("chance_next") if player.get("chance_next") is not None else 101)
+    if flagged:
+        player = flagged[0]
+        chance = player.get("chance_next")
+        chance_text = "minutes are unstable" if chance is None else f"{chance}% chance of playing next GW"
+        alerts.append({
+            "priority": 95,
+            "severity": "high",
+            "title": f"{player['web_name']} is forcing the move",
+            "detail": f"{chance_text}. Injury and minutes risk should outrank softer correlation tweaks.",
+        })
+
+    worst_team = None
+    worst_score = 0.0
+    for players in by_team.values():
+        if len(players) < 2:
+            continue
+        score = 0.0
+        for player in players:
+            score += _fixture_run_score(
+                fixtures_by_team.get(player["team_id"], [])[:horizon],
+                player["team_id"],
+                player.get("pos_type") in (1, 2),
+            )
+        if score < worst_score:
+            worst_score = score
+            worst_team = players
+    if worst_team:
+        names = ", ".join(player["web_name"] for player in worst_team[:3])
+        alerts.append({
+            "priority": 85,
+            "severity": "high" if worst_score < -7 else "medium",
+            "title": f"{worst_team[0]['team_short']} fixture turn is stressing the squad",
+            "detail": f"{names} all carry a poor {horizon}-GW run. If you are starting the reshuffle somewhere, start here.",
+        })
+
+    expensive_bench = [
+        player for player in squad
+        if player["squad_position"] > 11 and _player_price(player) >= 5.0 and (player.get("ep_next") or 0) <= 2.8
+    ]
+    if expensive_bench:
+        player = sorted(expensive_bench, key=_player_price, reverse=True)[0]
+        alerts.append({
+            "priority": 70,
+            "severity": "medium",
+            "title": "Cash is parked on the bench",
+            "detail": f"{player['web_name']} ties up £{_player_price(player):.1f}m without much near-term output. That money can fund a stronger front-line move.",
+        })
+
+    alerts.append({
+        "priority": 50,
+        "severity": "info",
+        "title": f"Plan through the next {horizon} GWs",
+        "detail": planning_reason,
+    })
+
+    if len(sell_players) > 6:
+        alerts.append({
+            "priority": 40,
+            "severity": "info",
+            "title": "Search is widest up to 6 transfers",
+            "detail": "The engine will still rank larger plans, but the search and scoring are tuned most aggressively for 1 to 6 exits.",
+        })
+
+    alerts.sort(key=lambda alert: alert["priority"], reverse=True)
+    return [{k: v for k, v in alert.items() if k != "priority"} for alert in alerts[:4]]
+
+
+async def _compute_plan_context(database, squad: list[dict], event: int, horizon: int) -> dict:
+    starters = [player for player in squad if player["squad_position"] <= 11]
+    starter_ids = [player["player_id"] for player in starters]
+    captain_idx = next((idx for idx, player in enumerate(starters) if player.get("is_captain")), None)
+
+    emp_cov, gws_used = await analysis.compute_empirical_covariance(starter_ids, database)
+    struct_cov = await analysis.compute_structural_covariance(starter_ids, database)
+    alpha = 0.6 if len(gws_used) < 15 else 0.4
+    cov = analysis.ledoit_wolf_shrinkage(emp_cov, struct_cov, alpha)
+    if horizon > 0:
+        fixture_cov = await analysis.compute_forward_fixture_covariance(starter_ids, database, event, horizon)
+        cov = analysis.ledoit_wolf_shrinkage(cov, fixture_cov, analysis.FIXTURE_FORECAST_ALPHA)
+    exposure = analysis.compute_exposure_metrics(starter_ids, starters, cov, captain_idx)
+    return {
+        "starters": starters,
+        "starter_ids": starter_ids,
+        "captain_idx": captain_idx,
+        "cov": cov,
+        "exposure": exposure,
+    }
+
+
+async def _compute_proposed_exposure(database, starters: list[dict], event: int, horizon: int, captain_idx: int | None) -> tuple[dict, np.ndarray]:
+    starter_ids = [player["player_id"] for player in starters]
+    emp_cov, gws_used = await analysis.compute_empirical_covariance(starter_ids, database)
+    struct_cov = await analysis.compute_structural_covariance(starter_ids, database)
+    alpha = 0.6 if len(gws_used) < 15 else 0.4
+    cov = analysis.ledoit_wolf_shrinkage(emp_cov, struct_cov, alpha)
+    if horizon > 0:
+        fixture_cov = await analysis.compute_forward_fixture_covariance(starter_ids, database, event, horizon)
+        cov = analysis.ledoit_wolf_shrinkage(cov, fixture_cov, analysis.FIXTURE_FORECAST_ALPHA)
+    return analysis.compute_exposure_metrics(starter_ids, starters, cov, captain_idx), cov
+
+
+def _top_correlation_changes(
+    current_starters: list[dict],
+    proposed_starters: list[dict],
+    current_corr: list[list[float]],
+    proposed_corr: list[list[float]],
+    changed_indices: set[int],
+) -> list[dict]:
+    if not changed_indices:
+        return []
+    changes = []
+    for i in range(len(current_starters)):
+        for j in range(i + 1, len(current_starters)):
+            if i not in changed_indices and j not in changed_indices:
+                continue
+            delta = round(float(proposed_corr[i][j]) - float(current_corr[i][j]), 3)
+            changes.append({
+                "player_a": proposed_starters[i]["web_name"],
+                "player_b": proposed_starters[j]["web_name"],
+                "delta": delta,
+                "current": round(float(current_corr[i][j]), 3),
+                "proposed": round(float(proposed_corr[i][j]), 3),
+            })
+    changes.sort(key=lambda row: abs(row["delta"]), reverse=True)
+    return changes[:6]
+
+
+async def _simulate_transfer_plan(
+    database,
+    squad: list[dict],
+    context: dict,
+    picks_by_sell_id: dict[int, dict],
+    event: int,
+    horizon: int,
+) -> dict:
+    current_exposure = context["exposure"]
+    current_cov = context["cov"]
+    starters = context["starters"]
+    captain_idx = context["captain_idx"]
+
+    changed_indices = set()
+    proposed_starters = list(starters)
+    sell_lookup = {player["player_id"]: player for player in squad}
+
+    for idx, starter in enumerate(starters):
+        candidate = picks_by_sell_id.get(starter["player_id"])
+        if not candidate:
+            continue
+        changed_indices.add(idx)
+        proposed_starters[idx] = {
+            **starter,
+            "player_id": candidate["id"],
+            "web_name": candidate["web_name"],
+            "team_id": candidate["team_id"],
+            "team_name": candidate["team_name"],
+            "team_short": candidate["team_short"],
+            "pos_type": candidate["position"],
+            "now_cost": int(round(candidate["price"] * 10)),
+            "total_points": candidate.get("total_points", 0),
+            "form": candidate.get("form"),
+            "ep_next": candidate.get("ep_next"),
+            "selected_pct": candidate.get("selected_pct"),
+            "xg": candidate.get("xg", 0),
+            "xa": candidate.get("xa", 0),
+            "xgi": candidate.get("xgi"),
+            "minutes": candidate.get("minutes", 0),
+            "starts": candidate.get("starts", 0),
+        }
+
+    if changed_indices:
+        proposed_exposure, proposed_cov = await _compute_proposed_exposure(
+            database,
+            proposed_starters,
+            event,
+            horizon,
+            captain_idx,
+        )
+    else:
+        proposed_exposure = current_exposure
+        proposed_cov = current_cov
+
+    ep_next_delta = 0.0
+    for sell_id, candidate in picks_by_sell_id.items():
+        sold = sell_lookup[sell_id]
+        ep_next_delta += float(candidate.get("ep_next") or 0) - float(sold.get("ep_next") or 0)
+
+    return {
+        "current": current_exposure,
+        "proposed": proposed_exposure,
+        "delta": {
+            "portfolio_std": round(proposed_exposure["portfolio_std"] - current_exposure["portfolio_std"], 2),
+            "hhi": round(proposed_exposure["hhi"] - current_exposure["hhi"], 4),
+            "enb": round(proposed_exposure["enb"] - current_exposure["enb"], 1),
+            "diversification_ratio": round(
+                proposed_exposure["diversification_ratio"] - current_exposure["diversification_ratio"], 2
+            ),
+            "ep_next": round(ep_next_delta, 1),
+        },
+        "correlation_changes": _top_correlation_changes(
+            starters,
+            proposed_starters,
+            current_exposure["correlation_matrix"],
+            proposed_exposure["correlation_matrix"],
+            changed_indices,
+        ),
+        "callouts": analysis.generate_risk_callouts(proposed_starters, proposed_exposure, proposed_cov),
+    }
+
+
+def _plan_budget_bonus(spent: float, budget: float) -> float:
+    if budget <= 0:
+        return 0.0
+    left = max(budget - spent, 0.0)
+    usage = spent / budget
+    bonus = usage * 0.85
+    if left >= 1.5:
+        bonus -= min(left, 4.0) * 0.18
+    return bonus
+
+
+def _plan_score(state: dict, sim: dict, plan_budget: float) -> float:
+    projected = state["projected_gain"] * 1.45
+    immediate = (sim["delta"]["ep_next"] or 0) * 0.3
+    correlation = (
+        (sim["delta"]["enb"] or 0) * 1.8
+        - (sim["delta"]["portfolio_std"] or 0) * 0.28
+        - (sim["delta"]["hhi"] or 0) * 52
+    )
+    fixtures = state["fixture_swing"] * 0.3
+    xgi = state["xgi_gain"] * 0.45
+    budget = _plan_budget_bonus(state["spent"], plan_budget)
+    return projected + immediate + correlation + fixtures + xgi + budget
+
+
+def _describe_plan(state: dict, sim: dict, horizon: int, plan_budget: float) -> str:
+    parts = [
+        f"{state['projected_gain']:+.1f} projected pts over {horizon} GWs",
+    ]
+    if sim["delta"]["enb"] > 0.2 or sim["delta"]["hhi"] < -0.01:
+        parts.append("cleans up correlation")
+    elif sim["delta"]["enb"] < -0.2 or sim["delta"]["hhi"] > 0.01:
+        parts.append("adds correlation risk")
+
+    if state["fixture_swing"] > 1.5:
+        parts.append("leans into the better fixture run")
+    if plan_budget - state["spent"] <= 0.5:
+        parts.append("uses almost all of the budget")
+    elif plan_budget - state["spent"] >= 1.5:
+        parts.append(f"leaves £{plan_budget - state['spent']:.1f}m unused")
+    return ". ".join(parts[:3]) + "."
+
+
+async def _optimize_transfer_plans(
+    database,
+    squad: list[dict],
+    sell_players: list[dict],
+    slot_plan_pools: list[dict],
+    base_team_counts: dict[int, int],
+    event: int,
+    horizon: int,
+    plan_budget: float,
+    limit: int = MAX_PLAN_RESULTS,
+) -> list[dict]:
+    if not slot_plan_pools:
+        return []
+
+    ordered_slots = sorted(slot_plan_pools, key=lambda row: (len(row["plan_pool"]), row["sell_name"]))
+    suffix_min_cost = [0.0] * (len(ordered_slots) + 1)
+    for idx in range(len(ordered_slots) - 1, -1, -1):
+        slot_min = min(candidate["price"] for candidate in ordered_slots[idx]["plan_pool"])
+        suffix_min_cost[idx] = suffix_min_cost[idx + 1] + slot_min
+
+    beam = [{
+        "picks": {},
+        "selected_ids": set(),
+        "team_adds": Counter(),
+        "spent": 0.0,
+        "approx_score": 0.0,
+        "projected_gain": 0.0,
+        "fixture_swing": 0.0,
+        "xgi_gain": 0.0,
+        "uses_plan_budget": False,
+    }]
+
+    beam_width = MAX_BEAM_WIDTH if len(ordered_slots) <= 6 else 80
+
+    for idx, slot in enumerate(ordered_slots):
+        next_beam = []
+        remaining_min = suffix_min_cost[idx + 1]
+        for state in beam:
+            for candidate in slot["plan_pool"]:
+                if candidate["id"] in state["selected_ids"]:
+                    continue
+                if base_team_counts.get(candidate["team_id"], 0) + state["team_adds"][candidate["team_id"]] >= 3:
+                    continue
+                new_spent = state["spent"] + candidate["price"]
+                if new_spent > plan_budget + 1e-9:
+                    continue
+                if new_spent + remaining_min > plan_budget + 1e-9:
+                    continue
+
+                team_adds = state["team_adds"].copy()
+                team_adds[candidate["team_id"]] += 1
+                picks = dict(state["picks"])
+                picks[slot["sell_id"]] = candidate
+
+                next_beam.append({
+                    "picks": picks,
+                    "selected_ids": set(state["selected_ids"]) | {candidate["id"]},
+                    "team_adds": team_adds,
+                    "spent": new_spent,
+                    "approx_score": (
+                        state["approx_score"]
+                        + candidate["score"]
+                        + _plan_budget_bonus(new_spent, plan_budget) * 0.1
+                    ),
+                    "projected_gain": state["projected_gain"] + candidate["breakdown"]["projected_gain"],
+                    "fixture_swing": state["fixture_swing"] + candidate["breakdown"]["fixture_run"],
+                    "xgi_gain": state["xgi_gain"] + candidate["breakdown"]["xgi_per90_delta"],
+                    "uses_plan_budget": state["uses_plan_budget"] or candidate["requires_plan_budget"],
+                })
+
+        next_beam.sort(
+            key=lambda row: (
+                row["approx_score"],
+                row["projected_gain"],
+                -row["spent"],
+            ),
+            reverse=True,
+        )
+        beam = next_beam[:beam_width]
+
+    context = await _compute_plan_context(database, squad, event, horizon)
+    exact_candidates = beam[:MAX_EXACT_PLAN_EVALS]
+    evaluated = []
+    sell_lookup = {player["player_id"]: player for player in sell_players}
+
+    for state in exact_candidates:
+        sim = await _simulate_transfer_plan(database, squad, context, state["picks"], event, horizon)
+        score = _plan_score(state, sim, plan_budget)
+        slots = []
+        for sell_player in sell_players:
+            candidate = state["picks"].get(sell_player["player_id"])
+            if not candidate:
+                continue
+            slots.append({
+                "sell_id": sell_player["player_id"],
+                "sell_name": sell_player["web_name"],
+                "sell_team": sell_player.get("team_short", "???"),
+                "sell_price": round(_player_price(sell_player), 1),
+                "candidate": candidate,
+            })
+        evaluated.append({
+            "score": round(score, 2),
+            "spent": round(state["spent"], 1),
+            "budget": round(plan_budget, 1),
+            "budget_left": round(max(plan_budget - state["spent"], 0.0), 1),
+            "budget_usage_pct": round((state["spent"] / plan_budget) * 100, 1) if plan_budget > 0 else 0.0,
+            "projected_ep_gain": round(state["projected_gain"], 1),
+            "fixture_swing": round(state["fixture_swing"], 2),
+            "xgi_gain": round(state["xgi_gain"], 2),
+            "uses_plan_budget": state["uses_plan_budget"],
+            "slots": slots,
+            "summary": _describe_plan(state, sim, horizon, plan_budget),
+            "current": {
+                "portfolio_std": context["exposure"]["portfolio_std"],
+                "hhi": context["exposure"]["hhi"],
+                "enb": context["exposure"]["enb"],
+                "diversification_ratio": context["exposure"]["diversification_ratio"],
+            },
+            "proposed": {
+                "portfolio_std": sim["proposed"]["portfolio_std"],
+                "hhi": sim["proposed"]["hhi"],
+                "enb": sim["proposed"]["enb"],
+                "diversification_ratio": sim["proposed"]["diversification_ratio"],
+            },
+            "delta": sim["delta"],
+            "correlation_changes": sim["correlation_changes"][:4],
+            "callouts": sim["callouts"][:3],
+        })
+
+    evaluated.sort(
+        key=lambda row: (
+            row["score"],
+            row["projected_ep_gain"],
+            -row["budget_left"],
+        ),
+        reverse=True,
+    )
+    return evaluated[:limit]
 
 
 async def recommend_replacements(
@@ -27,244 +770,379 @@ async def recommend_replacements(
     sell_player_ids: list[int],
     event: int | None = None,
     n: int = 5,
+    horizon: int | None = None,
 ) -> dict:
     """
-    Given 1+ players to sell, recommend top N replacements for each slot.
-
-    Returns per-slot recommendations with composite scores and breakdown.
+    Given 1+ players to sell, recommend top replacements for each slot and
+    rank the best combined transfer plans across the whole selected set.
     """
     database = await db.get_db()
     try:
         if event is None:
             event = await db.get_current_event(database)
+        if event is None:
+            raise ValueError("No current event found — sync data first")
+
+        horizon = _normalize_horizon(horizon)
+        squad = await db.get_manager_squad(database, manager_id, event)
+        if not squad:
+            raise ValueError(f"No squad for manager {manager_id}")
+
+        mgr_rows = await database.execute_fetchall("SELECT * FROM manager_info WHERE id=?", (manager_id,))
+        bank = (dict(mgr_rows[0]).get("bank") or 0) / 10 if mgr_rows else 0
+
+        team_rows = await database.execute_fetchall("SELECT id, short_name, name FROM teams")
+        team_lookup = {row["id"]: dict(row) for row in team_rows}
+
+        all_rows = await database.execute_fetchall("""
+            SELECT p.*, t.short_name as team_short, t.name as team_name
+            FROM players p
+            JOIN teams t ON p.team_id = t.id
+            WHERE p.minutes > 0 AND p.status IN ('a', 'd')
+        """)
+        all_players = {row["id"]: dict(row) for row in all_rows}
+
+        fixture_rows = await database.execute_fetchall("""
+            SELECT *
+            FROM fixtures
+            WHERE event >= ? AND event IS NOT NULL AND finished=0
+            ORDER BY event, kickoff_time, id
+            LIMIT 300
+        """, (event,))
+        fixtures_by_team = defaultdict(list)
+        for fixture in (dict(row) for row in fixture_rows):
+            fixtures_by_team[fixture["team_h"]].append(fixture)
+            fixtures_by_team[fixture["team_a"]].append(fixture)
+
+        squad_lookup = {player["player_id"]: player for player in squad}
+        sell_players = []
+        recommendations = []
+
+        for sell_id in sell_player_ids:
+            sell_player = squad_lookup.get(sell_id)
+            if sell_player:
+                sell_players.append(sell_player)
+            else:
+                recommendations.append({"sell_id": sell_id, "error": "Not in squad"})
+
+        removed_player_ids = {player["player_id"] for player in sell_players}
+        keep_player_ids = {player["player_id"] for player in squad if player["player_id"] not in removed_player_ids}
+        team_counts = Counter(player["team_id"] for player in squad)
+        base_team_counts = Counter(team_counts)
+        for player in sell_players:
+            base_team_counts[player["team_id"]] -= 1
+            if base_team_counts[player["team_id"]] <= 0:
+                base_team_counts.pop(player["team_id"], None)
+
+        plan_budget = bank + sum(_player_price(player) for player in sell_players)
+        recommended_horizon, planning_reason = _recommended_horizon(squad, sell_players, fixtures_by_team)
+
+        slot_min_costs = {}
+        for sell_player in sell_players:
+            pos = sell_player["pos_type"]
+            min_cost = None
+            for candidate in all_players.values():
+                if not _candidate_is_eligible(candidate, keep_player_ids, removed_player_ids, base_team_counts, pos):
+                    continue
+                price = _player_price(candidate)
+                if min_cost is None or price < min_cost:
+                    min_cost = price
+            slot_min_costs[sell_player["player_id"]] = min_cost
+
+        slot_plan_pools = []
+        for sell_player in sell_players:
+            sell_id = sell_player["player_id"]
+            pos = sell_player["pos_type"]
+            sell_price = _player_price(sell_player)
+            slot_budget = sell_price + bank
+            min_other_cost = sum(
+                min_cost or 0.0
+                for other_sell_id, min_cost in slot_min_costs.items()
+                if other_sell_id != sell_id
+            )
+            max_plan_price = max(slot_budget, plan_budget - min_other_cost)
+
+            scored = []
+            for candidate in all_players.values():
+                if not _candidate_is_eligible(candidate, keep_player_ids, removed_player_ids, base_team_counts, pos):
+                    continue
+                if _player_price(candidate) > max_plan_price + 1e-9:
+                    continue
+                row = _build_candidate_record(
+                    candidate,
+                    sell_player,
+                    fixtures_by_team,
+                    team_lookup,
+                    event,
+                    base_team_counts,
+                    horizon,
+                    slot_budget,
+                )
+                row["position"] = pos
+                row["xg"] = candidate.get("xg")
+                row["xa"] = candidate.get("xa")
+                scored.append(row)
+
+            scored.sort(
+                key=lambda row: (
+                    row["score"],
+                    row["breakdown"]["projected_gain"],
+                    row["projected_ep"],
+                ),
+                reverse=True,
+            )
+
+            recommendations.append({
+                "sell_id": sell_id,
+                "sell_name": sell_player["web_name"],
+                "sell_team": sell_player.get("team_short", "???"),
+                "sell_price": round(sell_price, 1),
+                "position": analysis.POS_NAMES.get(pos, "???"),
+                "slot_budget": round(slot_budget, 1),
+                "plan_max_price": round(max_plan_price, 1),
+                "sell_projected_ep": round(_project_player_ep(sell_player, fixtures_by_team, horizon, event), 1),
+                "candidates": scored[:n],
+                "total_candidates": len(scored),
+            })
+
+            if scored:
+                slot_plan_pools.append({
+                    "sell_id": sell_id,
+                    "sell_name": sell_player["web_name"],
+                    "plan_pool": _build_plan_pool(scored),
+                })
+
+        recommendations.sort(key=lambda row: sell_player_ids.index(row["sell_id"]) if row.get("sell_id") in sell_player_ids else 999)
+        plans = []
+        if slot_plan_pools and len(slot_plan_pools) == len(sell_players):
+            plans = await _optimize_transfer_plans(
+                database,
+                squad,
+                sell_players,
+                slot_plan_pools,
+                base_team_counts,
+                event,
+                horizon,
+                plan_budget,
+                limit=min(MAX_PLAN_RESULTS, max(n, 3)),
+            )
+        alerts = _build_transfer_alerts(
+            squad,
+            sell_players,
+            recommendations,
+            fixtures_by_team,
+            horizon,
+            planning_reason,
+        )
+
+        return {
+            "recommendations": recommendations,
+            "plans": plans,
+            "alerts": alerts,
+            "planning": {
+                "selected_horizon": horizon,
+                "recommended_horizon": recommended_horizon,
+                "recommended_reason": planning_reason,
+                "window_start_event": event,
+                "window_end_event": event + horizon - 1,
+                "supports_full_plan_size": 6,
+                "selection_size": len(sell_players),
+            },
+            "bank": bank,
+            "plan_budget": round(plan_budget, 1),
+            "event": event,
+        }
+    finally:
+        await database.close()
+
+
+async def simulate_transfer_plan(
+    manager_id: int,
+    transfer_pairs: list[dict],
+    event: int | None = None,
+    horizon: int | None = None,
+) -> dict:
+    """
+    Simulate an arbitrary multi-transfer plan exactly.
+    Used for manual plans that do not match a suggested optimizer result.
+    """
+    database = await db.get_db()
+    try:
+        if event is None:
+            event = await db.get_current_event(database)
+        if event is None:
+            raise ValueError("No current event found — sync data first")
+        horizon = _normalize_horizon(horizon)
+
+        if not transfer_pairs:
+            raise ValueError("No transfer pairs supplied")
 
         squad = await db.get_manager_squad(database, manager_id, event)
         if not squad:
             raise ValueError(f"No squad for manager {manager_id}")
 
-        # current squad state
-        squad_player_ids = {s["player_id"] for s in squad}
-        team_counts = defaultdict(int)
-        for s in squad:
-            team_counts[s["team_id"]] += 1
-
-        # bank from manager info
         mgr_rows = await database.execute_fetchall("SELECT * FROM manager_info WHERE id=?", (manager_id,))
         bank = (dict(mgr_rows[0]).get("bank") or 0) / 10 if mgr_rows else 0
 
-        # load all players for candidate pool
+        team_rows = await database.execute_fetchall("SELECT id, short_name, name FROM teams")
+        team_lookup = {row["id"]: dict(row) for row in team_rows}
+
         all_rows = await database.execute_fetchall("""
             SELECT p.*, t.short_name as team_short, t.name as team_name
-            FROM players p JOIN teams t ON p.team_id = t.id
+            FROM players p
+            JOIN teams t ON p.team_id = t.id
             WHERE p.minutes > 0 AND p.status IN ('a', 'd')
         """)
-        all_players = {r["id"]: dict(r) for r in all_rows}
+        all_players = {row["id"]: dict(row) for row in all_rows}
 
-        # load fixtures for difficulty scoring
-        all_fixtures = await database.execute_fetchall("""
-            SELECT * FROM fixtures WHERE event >= ? AND event IS NOT NULL AND finished=0
-            ORDER BY event LIMIT 200
+        fixture_rows = await database.execute_fetchall("""
+            SELECT *
+            FROM fixtures
+            WHERE event >= ? AND event IS NOT NULL AND finished=0
+            ORDER BY event, kickoff_time, id
+            LIMIT 300
         """, (event,))
         fixtures_by_team = defaultdict(list)
-        for f in [dict(f) for f in all_fixtures]:
-            fixtures_by_team[f["team_h"]].append(f)
-            fixtures_by_team[f["team_a"]].append(f)
+        for fixture in (dict(row) for row in fixture_rows):
+            fixtures_by_team[fixture["team_h"]].append(fixture)
+            fixtures_by_team[fixture["team_a"]].append(fixture)
 
-        results = []
-        for sell_id in sell_player_ids:
-            sell_player = next((s for s in squad if s["player_id"] == sell_id), None)
+        squad_lookup = {player["player_id"]: player for player in squad}
+        sell_ids = []
+        buy_ids = set()
+        sell_players = []
+        for pair in transfer_pairs:
+            sell_id = int(pair.get("sell_id") or 0)
+            buy_id = int(pair.get("buy_id") or 0)
+            if not sell_id or not buy_id:
+                raise ValueError("Every transfer pair must include `sell_id` and `buy_id`")
+            if sell_id in sell_ids:
+                raise ValueError(f"Duplicate outgoing player in plan: {sell_id}")
+            if buy_id in buy_ids:
+                raise ValueError(f"Duplicate incoming player in plan: {buy_id}")
+            if buy_id == sell_id:
+                raise ValueError("Incoming player must differ from outgoing player")
+            sell_player = squad_lookup.get(sell_id)
             if not sell_player:
-                results.append({"sell_id": sell_id, "error": "Not in squad"})
-                continue
+                raise ValueError(f"Player {sell_id} is not in the squad")
+            sell_ids.append(sell_id)
+            buy_ids.add(buy_id)
+            sell_players.append(sell_player)
 
-            pos = sell_player["pos_type"]
-            sell_price = (sell_player["now_cost"] or 0) / 10
-            # selling price is ~50% of profit rounded down, but for simplicity use current price
-            budget = sell_price + bank
+        removed_player_ids = set(sell_ids)
+        if removed_player_ids & buy_ids:
+            raise ValueError("A transfer plan cannot buy back a selected outgoing player")
 
-            # teams at 3-player cap (excluding the sold player)
-            temp_counts = dict(team_counts)
-            temp_counts[sell_player["team_id"]] -= 1
-            blocked_teams = {t for t, c in temp_counts.items() if c >= 3}
+        keep_player_ids = {player["player_id"] for player in squad if player["player_id"] not in removed_player_ids}
+        base_team_counts = Counter(player["team_id"] for player in squad)
+        for player in sell_players:
+            base_team_counts[player["team_id"]] -= 1
+            if base_team_counts[player["team_id"]] <= 0:
+                base_team_counts.pop(player["team_id"], None)
 
-            # filter candidates
-            candidates = []
-            for p in all_players.values():
-                if p["id"] in squad_player_ids and p["id"] != sell_id:
-                    continue
-                if p["position"] != pos:
-                    continue
-                if (p["now_cost"] or 0) / 10 > budget:
-                    continue
-                if p["team_id"] in blocked_teams:
-                    continue
-                if p.get("chance_next") is not None and p["chance_next"] < 50:
-                    continue
-                candidates.append(p)
+        plan_budget = bank + sum(_player_price(player) for player in sell_players)
+        team_adds = Counter()
+        picks_by_sell_id = {}
+        projected_gain = 0.0
+        fixture_swing = 0.0
+        xgi_gain = 0.0
+        spent = 0.0
+        uses_plan_budget = False
 
-            # score each candidate, enrich with fixture strip
-            scored = []
-            for c in candidates:
-                score, breakdown = _score_candidate(
-                    c, sell_player, all_players, fixtures_by_team, event, squad, team_counts
-                )
-                # fixture strip for candidate
-                c_fixtures = fixtures_by_team.get(c["team_id"], [])[:HORIZON]
-                fix_strip = []
-                for f in c_fixtures:
-                    is_home = f["team_h"] == c["team_id"]
-                    opp_short = "???"
-                    # get opponent short name from DB would be ideal, use team_id for now
-                    fdr = f["team_a_difficulty"] if is_home else f["team_h_difficulty"]
-                    fix_strip.append({
-                        "event": f.get("event"),
-                        "difficulty": fdr or 3,
-                        "is_home": is_home,
-                    })
+        for pair in transfer_pairs:
+            sell_id = int(pair["sell_id"])
+            buy_id = int(pair["buy_id"])
+            sell_player = squad_lookup[sell_id]
+            candidate = all_players.get(buy_id)
+            if not candidate:
+                raise ValueError(f"Incoming player {buy_id} not found")
+            if candidate["id"] in keep_player_ids:
+                raise ValueError(f"{candidate['web_name']} is already in the squad")
+            if _player_position(candidate) != sell_player["pos_type"]:
+                raise ValueError(f"{candidate['web_name']} does not match {sell_player['web_name']}'s position")
+            if candidate.get("chance_next") is not None and candidate["chance_next"] < 50:
+                raise ValueError(f"{candidate['web_name']} fails the minutes threshold for recommendation")
+            if base_team_counts.get(candidate["team_id"], 0) + team_adds[candidate["team_id"]] >= 3:
+                raise ValueError(f"{candidate['team_short']} would exceed the three-player club limit")
 
-                # projected EP over horizon (decayed)
-                ep_proj = 0
-                ep_base = c.get("ep_next") or (c.get("form") or 2)
-                mult_map = DEF_MULT if c["position"] in (1, 2) else ATK_MULT
-                for i, f in enumerate(c_fixtures):
-                    is_home = f["team_h"] == c["team_id"]
-                    fdr = (f["team_a_difficulty"] if is_home else f["team_h_difficulty"]) or 3
-                    adj = mult_map.get(fdr, 1.0)
-                    ep_proj += ep_base * adj * DECAY ** i
+            slot_budget = _player_price(sell_player) + bank
+            row = _build_candidate_record(
+                candidate,
+                sell_player,
+                fixtures_by_team,
+                team_lookup,
+                event,
+                base_team_counts,
+                horizon,
+                slot_budget,
+            )
+            spent += row["price"]
+            if spent > plan_budget + 1e-9:
+                raise ValueError(f"Plan is over budget by £{spent - plan_budget:.1f}m")
+            team_adds[candidate["team_id"]] += 1
+            picks_by_sell_id[sell_id] = row
+            projected_gain += row["breakdown"]["projected_gain"]
+            fixture_swing += row["breakdown"]["fixture_run"]
+            xgi_gain += row["breakdown"]["xgi_per90_delta"]
+            uses_plan_budget = uses_plan_budget or row["requires_plan_budget"]
 
-                scored.append({
-                    "id": c["id"],
-                    "web_name": c["web_name"],
-                    "team_short": c.get("team_short", "???"),
-                    "team_name": c.get("team_name", "???"),
-                    "price": (c["now_cost"] or 0) / 10,
-                    "total_points": c.get("total_points", 0),
-                    "form": c.get("form"),
-                    "ep_next": c.get("ep_next"),
-                    "xgi": c.get("xgi"),
-                    "xgi_per90": round(c.get("xgi", 0) / max(c.get("minutes", 1), 1) * 90, 2),
-                    "selected_pct": c.get("selected_pct"),
-                    "starts": c.get("starts", 0),
-                    "minutes": c.get("minutes", 0),
-                    "goals": c.get("goals_scored", 0),
-                    "assists": c.get("assists", 0),
-                    "clean_sheets": c.get("clean_sheets", 0),
-                    "penalties_order": c.get("penalties_order"),
-                    "corners_order": c.get("corners_order"),
-                    "score": round(score, 2),
-                    "breakdown": breakdown,
-                    "fixture_strip": fix_strip,
-                    "projected_ep": round(ep_proj, 1),
-                })
-
-            scored.sort(key=lambda x: x["score"], reverse=True)
-
-            results.append({
-                "sell_id": sell_id,
+        context = await _compute_plan_context(database, squad, event, horizon)
+        sim = await _simulate_transfer_plan(database, squad, context, picks_by_sell_id, event, horizon)
+        state = {
+            "picks": picks_by_sell_id,
+            "spent": spent,
+            "projected_gain": projected_gain,
+            "fixture_swing": fixture_swing,
+            "xgi_gain": xgi_gain,
+            "uses_plan_budget": uses_plan_budget,
+        }
+        score = _plan_score(state, sim, plan_budget)
+        slots = []
+        for sell_player in sell_players:
+            candidate = picks_by_sell_id[sell_player["player_id"]]
+            slots.append({
+                "sell_id": sell_player["player_id"],
                 "sell_name": sell_player["web_name"],
                 "sell_team": sell_player.get("team_short", "???"),
-                "sell_price": sell_price,
-                "position": analysis.POS_NAMES.get(pos, "???"),
-                "budget": round(budget, 1),
-                "candidates": scored[:n],
-                "total_candidates": len(candidates),
+                "sell_price": round(_player_price(sell_player), 1),
+                "candidate": candidate,
             })
 
-        return {"recommendations": results, "bank": bank, "event": event}
+        return {
+            "score": round(score, 2),
+            "spent": round(spent, 1),
+            "budget": round(plan_budget, 1),
+            "budget_left": round(max(plan_budget - spent, 0.0), 1),
+            "budget_usage_pct": round((spent / plan_budget) * 100, 1) if plan_budget > 0 else 0.0,
+            "projected_ep_gain": round(projected_gain, 1),
+            "fixture_swing": round(fixture_swing, 2),
+            "xgi_gain": round(xgi_gain, 2),
+            "uses_plan_budget": uses_plan_budget,
+            "slots": slots,
+            "summary": _describe_plan(state, sim, horizon, plan_budget),
+            "current": {
+                "portfolio_std": context["exposure"]["portfolio_std"],
+                "hhi": context["exposure"]["hhi"],
+                "enb": context["exposure"]["enb"],
+                "diversification_ratio": context["exposure"]["diversification_ratio"],
+            },
+            "proposed": {
+                "portfolio_std": sim["proposed"]["portfolio_std"],
+                "hhi": sim["proposed"]["hhi"],
+                "enb": sim["proposed"]["enb"],
+                "diversification_ratio": sim["proposed"]["diversification_ratio"],
+            },
+            "delta": sim["delta"],
+            "correlation_changes": sim["correlation_changes"][:6],
+            "callouts": sim["callouts"][:4],
+            "planning": {
+                "selected_horizon": horizon,
+                "window_start_event": event,
+                "window_end_event": event + horizon - 1,
+            },
+        }
     finally:
         await database.close()
-
-
-def _score_candidate(candidate, sell_player, all_players, fixtures_by_team, event, squad, team_counts) -> tuple[float, dict]:
-    """Composite transfer score with full breakdown."""
-    pos = candidate["position"]
-    is_def = pos in (1, 2)
-
-    # 1. EP delta
-    ep_in = candidate.get("ep_next") or 0
-    ep_out = sell_player.get("ep_next") or 0
-    ep_delta = ep_in - ep_out
-
-    # 2. Fixture run (next HORIZON GWs)
-    fix_in = fixtures_by_team.get(candidate["team_id"], [])[:HORIZON]
-    fix_out = fixtures_by_team.get(sell_player["team_id"], [])[:HORIZON]
-    fix_score_in = _fixture_run_score(fix_in, candidate["team_id"], is_def)
-    fix_score_out = _fixture_run_score(fix_out, sell_player["team_id"], is_def)
-    fixture_delta = fix_score_in - fix_score_out
-
-    # 3. Form trend
-    form_in = candidate.get("form") or 0
-    form_out = sell_player.get("form") or 0
-    form_delta = form_in - form_out
-
-    # 4. xGI delta
-    xgi_in = candidate.get("xgi") or 0
-    xgi_out = sell_player.get("xgi") or 0
-    mins_in = max(candidate.get("minutes") or 1, 1)
-    mins_out = max(sell_player.get("minutes") or 1, 1)
-    xgi_per90_in = xgi_in / mins_in * 90
-    xgi_per90_out = xgi_out / mins_out * 90
-    xgi_delta = (xgi_per90_in - xgi_per90_out) * 10
-
-    # 5. Correlation improvement
-    in_team_count = team_counts.get(candidate["team_id"], 0)
-    corr_score = 1.0 if in_team_count == 0 else (0.3 if in_team_count == 1 else -0.5)
-
-    # 6. Set piece / penalty bonus
-    sp_bonus = 0
-    if candidate.get("penalties_order") and candidate["penalties_order"] <= 2:
-        sp_bonus += 2.0
-    if candidate.get("corners_order") and candidate["corners_order"] <= 2:
-        sp_bonus += 0.5
-
-    # 7. Minutes confidence
-    starts = candidate.get("starts") or 0
-    possible_gws = max((event or 32), 1)
-    start_rate = starts / possible_gws if possible_gws > 0 else 0
-    mins_score = 1.0 if start_rate > 0.85 else (0.3 if start_rate > 0.65 else -1.0)
-
-    # 8. Price momentum
-    price_change = (candidate.get("now_cost") or 0) - (candidate.get("now_cost") or 0)  # need season start cost
-    price_score = 0.0  # simplified — would need cost_change_start from API
-
-    # Weighted composite
-    score = (
-        0.40 * ep_delta
-        + 0.15 * fixture_delta
-        + 0.12 * form_delta
-        + 0.12 * xgi_delta
-        + 0.06 * corr_score
-        + 0.05 * sp_bonus
-        + 0.05 * mins_score
-        + 0.05 * price_score
-    )
-
-    breakdown = {
-        "ep_delta": round(ep_delta, 2),
-        "fixture_run": round(fixture_delta, 2),
-        "form_trend": round(form_delta, 2),
-        "xgi_quality": round(xgi_delta, 2),
-        "diversification": round(corr_score, 2),
-        "set_pieces": round(sp_bonus, 2),
-        "minutes_confidence": round(mins_score, 2),
-    }
-
-    return score, breakdown
-
-
-def _fixture_run_score(fixtures: list, team_id: int, is_def: bool) -> float:
-    """Score a fixture run: positive = easy, negative = hard."""
-    if not fixtures:
-        return 0.0
-    mult = DEF_MULT if is_def else ATK_MULT
-    total = 0
-    for i, f in enumerate(fixtures):
-        is_home = f["team_h"] == team_id
-        fdr = f["team_a_difficulty"] if is_home else f["team_h_difficulty"]
-        fdr = fdr or 3
-        adj = mult.get(fdr, 1.0)
-        total += (adj - 1.0) * DECAY ** i
-    return total * 10  # scale up
 
 
 async def _ensure_manager_event_snapshot(database, manager_id: int, event: int) -> list[dict]:

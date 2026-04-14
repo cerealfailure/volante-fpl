@@ -128,7 +128,15 @@
           {#if !slot.error}
             <div class="rec-section card fade-in">
               <div class="card-header">
-                <h2>Replace {slot.sell_name} <span class="dim2">({slot.position}, £{slot.sell_price.toFixed(1)}m → budget £{slot.budget.toFixed(1)}m)</span></h2>
+                <h2>
+                  Replace {slot.sell_name}
+                  <span class="dim2">
+                    ({slot.position}, £{slot.sell_price.toFixed(1)}m → slot £{(slot.slot_budget ?? slot.budget).toFixed(1)}m
+                    {#if slot.plan_max_price != null}
+                      · plan max £{slot.plan_max_price.toFixed(1)}m
+                    {/if})
+                  </span>
+                </h2>
                 <span class="dim2 small">{slot.total_candidates} candidates</span>
               </div>
               <table class="rec-table">
