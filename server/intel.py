@@ -29,9 +29,10 @@ except ModuleNotFoundError:  # pragma: no cover - optional transport
 
 import analysis
 import db
+import projections
 import transfers
 
-MODEL_VERSION = "transfer-intel-v1"
+MODEL_VERSION = "transfer-intel-v2"
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_IMPORT_ROOT = ROOT_DIR / "data" / "external"
 
@@ -475,6 +476,15 @@ async def run_transfer_intelligence(
             event = await db.get_current_event(database)
         if event is None:
             raise ValueError("No current event found — sync data first")
+        await projections.snapshot_current_availability(
+            database,
+            event,
+            snapshot_kind="intel_run",
+            snapshot_reason=f"manager:{manager_id}",
+            force_history=True,
+        )
+        projection_context = await projections.build_projection_context(database, event, horizon)
+        projection_event = projection_context["target_event"]
 
         squad = await db.get_manager_squad(database, manager_id, event)
         if not squad:
@@ -493,24 +503,13 @@ async def run_transfer_intelligence(
         all_players = [dict(row) for row in all_rows]
         squad_lookup = {player["player_id"]: player for player in squad}
         team_counts = Counter(player["team_id"] for player in squad)
+        fixtures_by_team = projection_context["fixtures_by_team"]
 
-        fixture_rows = await database.execute_fetchall("""
-            SELECT *
-            FROM fixtures
-            WHERE event >= ? AND event IS NOT NULL AND finished=0
-            ORDER BY event, kickoff_time, id
-            LIMIT 300
-        """, (event,))
-        fixtures_by_team = defaultdict(list)
-        for fixture in (dict(row) for row in fixture_rows):
-            fixtures_by_team[fixture["team_h"]].append(fixture)
-            fixtures_by_team[fixture["team_a"]].append(fixture)
-
-        context = await transfers._compute_plan_context(database, squad, event, horizon)
+        context = await transfers._compute_plan_context(database, squad, projection_event, horizon)
         correlation_pressures = _correlation_pressures(context)
         team_fixture_scores = _team_fixture_scores(squad, fixtures_by_team, horizon)
         source_defs = {source["key"]: source for source in await db.get_signal_sources(database, enabled_only=False)}
-        external_rows = await db.get_latest_projection_rows(database, event, horizon)
+        external_rows = await db.get_latest_projection_rows(database, projection_event, horizon)
         external_by_player = defaultdict(list)
         for row in external_rows:
             external_by_player[row["player_id"]].append(row)
@@ -519,7 +518,9 @@ async def run_transfer_intelligence(
         for player in all_players:
             pos = player["position"]
             player_id = player["id"]
-            internal_xp = transfers._project_player_ep(player, fixtures_by_team, horizon, event)
+            projection = projections.project_player(player, fixtures_by_team, horizon, event, projection_context)
+            internal_xp = projection["horizon_ep"]
+            availability = projection["availability"]
 
             source_values = [{
                 "source_key": "fpl_internal",
@@ -541,16 +542,18 @@ async def run_transfer_intelligence(
                     "derived": derived,
                 })
 
-            consensus_xp, uncertainty, disagreement = _blend_projection_values(source_values, internal_xp)
+            consensus_xp, source_uncertainty, disagreement = _blend_projection_values(source_values, internal_xp)
+            uncertainty = source_uncertainty + float(availability.get("uncertainty", 0)) * 0.55
             fixture_score = transfers._fixture_run_score(
                 fixtures_by_team.get(player["team_id"], [])[:horizon],
                 player["team_id"],
                 pos in (1, 2),
             )
             correlation_pressure = correlation_pressures.get(player_id, 0.0)
-            minutes_risk = max(0.0, 1.0 - transfers._minutes_factor(player, event))
+            minutes_risk = max(0.0, 1.0 - float(availability.get("play_probability", 0)))
             squad_count = team_counts.get(player["team_id"], 0)
             price = (player.get("now_cost") or 0) / 10.0
+            signal_gap = abs(float(projection.get("official_gap", 0)))
 
             transfer_pressure = (
                 max(0.0, 4.0 - consensus_xp) * 1.12
@@ -559,6 +562,7 @@ async def run_transfer_intelligence(
                 + uncertainty * 0.95
                 + minutes_risk * 2.4
                 + max(squad_count - 1, 0) * 0.38
+                + max(signal_gap - 1.5, 0.0) * 0.35
             )
             if player_id in squad_lookup and squad_lookup[player_id]["squad_position"] > 11:
                 transfer_pressure += max(price - 4.5, 0) * 0.55
@@ -574,6 +578,10 @@ async def run_transfer_intelligence(
                 "status": player.get("status"),
                 "chance_next": player.get("chance_next"),
                 "internal_xp": round(internal_xp, 2),
+                "modeled_next_xp": round(projection["next_event_ep"], 2),
+                "official_ep_next": round(projection["official_ep_next"], 2),
+                "official_gap": round(projection["official_gap"], 2),
+                "projection_event": projection_event,
                 "consensus_xp": round(consensus_xp, 2),
                 "xp_edge": round(consensus_xp - internal_xp, 2),
                 "uncertainty": round(uncertainty, 2),
@@ -582,6 +590,11 @@ async def run_transfer_intelligence(
                 "fixture_score": round(fixture_score, 2),
                 "correlation_pressure": round(correlation_pressure, 3),
                 "minutes_risk": round(minutes_risk, 3),
+                "availability_reliability": round(float(availability.get("reliability_score", 0)), 3),
+                "distortion_rate": round(float(availability.get("distortion_rate", 0)), 3),
+                "news_category": availability.get("news_category"),
+                "news_purity": round(float(availability.get("news_purity", 0)), 3),
+                "expected_minutes_next": round(float(projection.get("expected_minutes_next", 0)), 1),
                 "transfer_pressure": round(transfer_pressure, 2),
                 "sources": raw_sources,
             })
@@ -647,6 +660,38 @@ async def run_transfer_intelligence(
                 4.8 + card["uncertainty"],
                 f"projection-disagreement:{card['player_id']}",
                 {"player_id": card["player_id"], "sources": card["sources"]},
+            ))
+
+        availability_dissonance = [
+            card for card in squad_cards
+            if abs(card.get("official_gap", 0)) >= 2.0
+            or (card.get("distortion_rate", 0) >= 0.22 and card.get("news_purity", 0) >= 0.55)
+        ]
+        if availability_dissonance:
+            card = max(
+                availability_dissonance,
+                key=lambda row: (abs(row.get("official_gap", 0)), row.get("distortion_rate", 0)),
+            )
+            alerts.append(_make_alert(
+                manager_id,
+                event,
+                horizon,
+                "availability_signal",
+                f"Availability model distrusts the surface signal on {card['web_name']}",
+                (
+                    f"Official next-GW EP is {card['official_ep_next']:.1f}, modeled next-GW xP is {card['modeled_next_xp']:.1f}, "
+                    f"and similar {card['team_short']} availability cases carry a {card['availability_reliability'] * 100:.0f}% truth score "
+                    f"with {card['distortion_rate'] * 100:.0f}% distortion."
+                ),
+                4.7 + abs(card.get("official_gap", 0)) + card.get("distortion_rate", 0) * 4.0,
+                f"availability-signal:{card['player_id']}",
+                {
+                    "player_id": card["player_id"],
+                    "official_ep_next": card["official_ep_next"],
+                    "modeled_next_xp": card["modeled_next_xp"],
+                    "distortion_rate": card["distortion_rate"],
+                    "news_category": card["news_category"],
+                },
             ))
 
         expensive_bench = [
@@ -749,6 +794,7 @@ async def run_transfer_intelligence(
         summary = {
             "manager_id": manager_id,
             "event": event,
+            "projection_event": projection_event,
             "horizon": horizon,
             "model_version": MODEL_VERSION,
             "alerts_count": len(alerts),

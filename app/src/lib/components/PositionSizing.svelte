@@ -15,12 +15,13 @@
     players: any[];
     onPlayerClick?: (p: any) => void;
   } = $props();
+  const displayEp = (player: any) => player?.projected_ep_next ?? player?.projected_ep_window ?? player?.ep_next ?? 0;
 
   // Effective weight = ep_next, doubled for captain
   let rows = $derived.by(() => {
     const withWeight = players.map((p: any) => ({
       ...p,
-      _w: (p.ep_next ?? 0) * (p.is_captain ? 2 : 1),
+      _w: displayEp(p) * (p.is_captain ? 2 : 1),
     }));
     const total = withWeight.reduce((s: number, p: any) => s + p._w, 0) || 1;
     return withWeight

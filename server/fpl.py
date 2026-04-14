@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 
 import db
 import fpl_client
+import projections
 
 CONCURRENCY = 5
 BATCH_DELAY = 0.1
@@ -119,6 +120,17 @@ async def sync_bootstrap() -> dict:
             "event_count": len(data.get("events", [])),
         }
         await db.set_sync(conn, "bootstrap", meta)
+        try:
+            await projections.snapshot_current_availability(
+                conn,
+                current_event,
+                snapshot_kind="bootstrap_sync",
+                snapshot_reason="official-bootstrap-refresh",
+            )
+        except Exception:
+            # Availability snapshots are an internal overlay. Core sync should
+            # still succeed if this write cannot be refreshed yet.
+            pass
         await conn.commit()
         print(f"  ✓ {len(data['teams'])} teams, {len(data['elements'])} players, GW{current_event}")
         return meta
@@ -140,6 +152,14 @@ async def sync_fixtures() -> dict:
             "finished": sum(1 for f in data if f.get("finished")),
         }
         await db.set_sync(conn, "fixtures", meta)
+        try:
+            await projections.snapshot_current_availability(
+                conn,
+                snapshot_kind="fixtures_sync",
+                snapshot_reason="official-fixtures-refresh",
+            )
+        except Exception:
+            pass
         await conn.commit()
         print(f"  ✓ {meta['count']} fixtures ({meta['finished']} finished)")
         return meta

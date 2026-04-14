@@ -17,14 +17,15 @@ from collections import Counter, defaultdict
 import db
 import analysis
 import fpl
+import projections
 
 # ── Fixture difficulty multipliers (position-aware) ──────────────────
 # From PitchIQ research. FDR 1=easy, 5=hard.
-ATK_MULT = {1: 1.18, 2: 1.15, 3: 1.00, 4: 0.86, 5: 0.72}
-DEF_MULT = {1: 1.15, 2: 1.10, 3: 1.00, 4: 0.90, 5: 0.80}
-DECAY = 0.85  # per-GW decay for projections
-DEFAULT_HORIZON = 5
-SUPPORTED_HORIZONS = (3, 5, 8)
+ATK_MULT = projections.ATK_MULT
+DEF_MULT = projections.DEF_MULT
+DECAY = projections.DECAY
+DEFAULT_HORIZON = projections.DEFAULT_HORIZON
+SUPPORTED_HORIZONS = projections.SUPPORTED_HORIZONS
 MAX_PLAN_POOL = 16
 MAX_PLAN_RESULTS = 5
 MAX_BEAM_WIDTH = 120
@@ -32,12 +33,7 @@ MAX_EXACT_PLAN_EVALS = 24
 
 
 def _normalize_horizon(horizon: int | None) -> int:
-    if horizon is None:
-        return DEFAULT_HORIZON
-    horizon = max(1, min(8, int(horizon)))
-    if horizon in SUPPORTED_HORIZONS:
-        return horizon
-    return min(SUPPORTED_HORIZONS, key=lambda option: abs(option - horizon))
+    return projections.normalize_horizon(horizon)
 
 
 def _player_price(player: dict) -> float:
@@ -57,53 +53,31 @@ def _player_xgi_per90(player: dict) -> float:
     return float((player.get("xgi") or 0) / minutes * 90)
 
 
-def _minutes_factor(player: dict, event: int | None) -> float:
-    chance = player.get("chance_next")
-    chance_factor = 1.0 if chance is None else max(0.35, min(1.0, chance / 100))
-    possible_gws = max(min(event or 1, 38), 1)
-    starts = player.get("starts") or 0
-    start_rate = min(max(starts / possible_gws, 0), 1)
-    start_factor = 0.72 + 0.33 * start_rate
-    return chance_factor * start_factor
+def _minutes_factor(player: dict, event: int | None, availability_state: dict | None = None) -> float:
+    availability = projections.explain_availability(player, event, availability_state)
+    return float(availability["minutes_factor"])
 
 
-def _projection_base(player: dict, event: int | None) -> float:
-    base = player.get("ep_next")
-    if base is None or base <= 0:
-        base = player.get("points_per_game")
-    if base is None or base <= 0:
-        base = player.get("form")
-    if base is None or base <= 0:
-        base = 2.0
-
-    pos = _player_position(player)
-    xgi_per90 = _player_xgi_per90(player)
-    if pos in (3, 4):
-        underlying = 1.6 + xgi_per90 * 2.1
-        base = 0.72 * float(base) + 0.28 * underlying
-    elif pos in (1, 2):
-        xgc_per90 = player.get("xgc_per90")
-        defensive_floor = 2.5 if xgc_per90 is None else max(1.8, 3.1 - float(xgc_per90))
-        base = 0.75 * float(base) + 0.25 * defensive_floor
-
-    return max(float(base), 0.5)
+def _projection_base(player: dict, event: int | None, availability_state: dict | None = None) -> float:
+    projection = projections.project_player(
+        player,
+        {player["team_id"]: []},
+        1,
+        event,
+        availability_state,
+    )
+    per_fixture = projection["per_fixture"][0]["ep"] if projection["per_fixture"] else projection["next_event_ep"]
+    return max(float(per_fixture), 0.5)
 
 
-def _project_player_ep(player: dict, fixtures_by_team: dict[int, list[dict]], horizon: int, event: int | None) -> float:
-    fixtures = fixtures_by_team.get(player["team_id"], [])[:horizon]
-    base = _projection_base(player, event)
-    mult_map = DEF_MULT if _player_position(player) in (1, 2) else ATK_MULT
-    total = 0.0
-
-    for i, fixture in enumerate(fixtures):
-        is_home = fixture["team_h"] == player["team_id"]
-        difficulty = (fixture["team_a_difficulty"] if is_home else fixture["team_h_difficulty"]) or 3
-        total += base * mult_map.get(difficulty, 1.0) * (DECAY ** i)
-
-    if not fixtures:
-        total = base
-
-    return total * _minutes_factor(player, event)
+def _project_player_ep(
+    player: dict,
+    fixtures_by_team: dict[int, list[dict]],
+    horizon: int,
+    event: int | None,
+    availability_state: dict | None = None,
+) -> float:
+    return projections.project_player_ep(player, fixtures_by_team, horizon, event, availability_state)
 
 
 def _fixture_run_score(fixtures: list[dict], team_id: int, is_def: bool) -> float:
@@ -147,17 +121,18 @@ def _score_candidate(
     event: int,
     base_team_counts: dict[int, int],
     horizon: int,
+    availability_state: dict | None = None,
 ) -> tuple[float, dict]:
     """Composite transfer score with horizon-aware breakdown."""
     pos = _player_position(candidate)
     is_def = pos in (1, 2)
 
-    ep_in = candidate.get("ep_next") or 0
-    ep_out = sell_player.get("ep_next") or 0
-    ep_delta = float(ep_in) - float(ep_out)
+    projection_in = projections.project_player(candidate, fixtures_by_team, horizon, event, availability_state)
+    projection_out = projections.project_player(sell_player, fixtures_by_team, horizon, event, availability_state)
+    ep_delta = float(projection_in["next_event_ep"]) - float(projection_out["next_event_ep"])
 
-    projected_in = _project_player_ep(candidate, fixtures_by_team, horizon, event)
-    projected_out = _project_player_ep(sell_player, fixtures_by_team, horizon, event)
+    projected_in = float(projection_in["horizon_ep"])
+    projected_out = float(projection_out["horizon_ep"])
     projected_gain = projected_in - projected_out
 
     fix_in = fixtures_by_team.get(candidate["team_id"], [])[:horizon]
@@ -181,7 +156,10 @@ def _score_candidate(
     if candidate.get("corners_order") and candidate["corners_order"] <= 2:
         set_piece_bonus += 0.45
 
-    minutes_score = (_minutes_factor(candidate, event) - _minutes_factor(sell_player, event)) * 4.0
+    minutes_score = (
+        _minutes_factor(candidate, event, availability_state)
+        - _minutes_factor(sell_player, event, availability_state)
+    ) * 4.0
 
     score = (
         projected_gain * 1.45
@@ -216,6 +194,7 @@ def _build_candidate_record(
     base_team_counts: dict[int, int],
     horizon: int,
     slot_budget: float,
+    availability_state: dict | None = None,
 ) -> dict:
     score, breakdown = _score_candidate(
         candidate,
@@ -224,8 +203,10 @@ def _build_candidate_record(
         event,
         base_team_counts,
         horizon,
+        availability_state,
     )
-    projected_ep = _project_player_ep(candidate, fixtures_by_team, horizon, event)
+    projection = projections.project_player(candidate, fixtures_by_team, horizon, event, availability_state)
+    projected_ep = projection["horizon_ep"]
     price = _player_price(candidate)
     return {
         "id": candidate["id"],
@@ -238,7 +219,11 @@ def _build_candidate_record(
         "total_points": candidate.get("total_points", 0),
         "form": candidate.get("form"),
         "ep_next": candidate.get("ep_next"),
+        "projected_ep_next": round(projection["next_event_ep"], 1),
         "projected_ep": round(projected_ep, 1),
+        "expected_minutes_next": projection["expected_minutes_next"],
+        "availability": projection["availability"],
+        "projection": projection,
         "xgi": candidate.get("xgi"),
         "xgi_per90": round(_player_xgi_per90(candidate), 2),
         "selected_pct": candidate.get("selected_pct"),
@@ -507,6 +492,7 @@ async def _simulate_transfer_plan(
     picks_by_sell_id: dict[int, dict],
     event: int,
     horizon: int,
+    projection_context: dict | None = None,
 ) -> dict:
     current_exposure = context["exposure"]
     current_cov = context["cov"]
@@ -557,7 +543,19 @@ async def _simulate_transfer_plan(
     ep_next_delta = 0.0
     for sell_id, candidate in picks_by_sell_id.items():
         sold = sell_lookup[sell_id]
-        ep_next_delta += float(candidate.get("ep_next") or 0) - float(sold.get("ep_next") or 0)
+        if projection_context is not None:
+            sold_projection = projections.project_player(
+                sold,
+                projection_context["fixtures_by_team"],
+                1,
+                event,
+                projection_context,
+            )
+            ep_next_delta += float(candidate.get("projected_ep_next") or candidate.get("ep_next") or 0) - float(
+                sold_projection["next_event_ep"]
+            )
+        else:
+            ep_next_delta += float(candidate.get("ep_next") or 0) - float(sold.get("ep_next") or 0)
 
     return {
         "current": current_exposure,
@@ -634,6 +632,7 @@ async def _optimize_transfer_plans(
     event: int,
     horizon: int,
     plan_budget: float,
+    projection_context: dict | None = None,
     limit: int = MAX_PLAN_RESULTS,
 ) -> list[dict]:
     if not slot_plan_pools:
@@ -705,13 +704,23 @@ async def _optimize_transfer_plans(
         )
         beam = next_beam[:beam_width]
 
-    context = await _compute_plan_context(database, squad, event, horizon)
+    forecast_event = projection_context["target_event"] if projection_context is not None else event
+    context = await _compute_plan_context(database, squad, forecast_event, horizon)
     exact_candidates = beam[:MAX_EXACT_PLAN_EVALS]
     evaluated = []
     sell_lookup = {player["player_id"]: player for player in sell_players}
 
     for state in exact_candidates:
-        sim = await _simulate_transfer_plan(database, squad, context, state["picks"], event, horizon)
+        forecast_event = projection_context["target_event"] if projection_context is not None else event
+        sim = await _simulate_transfer_plan(
+            database,
+            squad,
+            context,
+            state["picks"],
+            forecast_event,
+            horizon,
+            projection_context,
+        )
         score = _plan_score(state, sim, plan_budget)
         slots = []
         for sell_player in sell_players:
@@ -802,17 +811,9 @@ async def recommend_replacements(
         """)
         all_players = {row["id"]: dict(row) for row in all_rows}
 
-        fixture_rows = await database.execute_fetchall("""
-            SELECT *
-            FROM fixtures
-            WHERE event >= ? AND event IS NOT NULL AND finished=0
-            ORDER BY event, kickoff_time, id
-            LIMIT 300
-        """, (event,))
-        fixtures_by_team = defaultdict(list)
-        for fixture in (dict(row) for row in fixture_rows):
-            fixtures_by_team[fixture["team_h"]].append(fixture)
-            fixtures_by_team[fixture["team_a"]].append(fixture)
+        projection_context = await projections.build_projection_context(database, event, horizon)
+        fixtures_by_team = projection_context["fixtures_by_team"]
+        availability_state = projection_context
 
         squad_lookup = {player["player_id"]: player for player in squad}
         sell_players = []
@@ -877,6 +878,7 @@ async def recommend_replacements(
                     base_team_counts,
                     horizon,
                     slot_budget,
+                    availability_state,
                 )
                 row["position"] = pos
                 row["xg"] = candidate.get("xg")
@@ -900,7 +902,7 @@ async def recommend_replacements(
                 "position": analysis.POS_NAMES.get(pos, "???"),
                 "slot_budget": round(slot_budget, 1),
                 "plan_max_price": round(max_plan_price, 1),
-                "sell_projected_ep": round(_project_player_ep(sell_player, fixtures_by_team, horizon, event), 1),
+                "sell_projected_ep": round(_project_player_ep(sell_player, fixtures_by_team, horizon, event, availability_state), 1),
                 "candidates": scored[:n],
                 "total_candidates": len(scored),
             })
@@ -924,6 +926,7 @@ async def recommend_replacements(
                 event,
                 horizon,
                 plan_budget,
+                projection_context,
                 limit=min(MAX_PLAN_RESULTS, max(n, 3)),
             )
         alerts = _build_transfer_alerts(
@@ -943,14 +946,15 @@ async def recommend_replacements(
                 "selected_horizon": horizon,
                 "recommended_horizon": recommended_horizon,
                 "recommended_reason": planning_reason,
-                "window_start_event": event,
-                "window_end_event": event + horizon - 1,
+                "window_start_event": projection_context["target_event"],
+                "window_end_event": projection_context["target_event"] + horizon - 1,
                 "supports_full_plan_size": 6,
                 "selection_size": len(sell_players),
             },
             "bank": bank,
             "plan_budget": round(plan_budget, 1),
             "event": event,
+            "projection_event": projection_context["target_event"],
         }
     finally:
         await database.close()
@@ -995,17 +999,9 @@ async def simulate_transfer_plan(
         """)
         all_players = {row["id"]: dict(row) for row in all_rows}
 
-        fixture_rows = await database.execute_fetchall("""
-            SELECT *
-            FROM fixtures
-            WHERE event >= ? AND event IS NOT NULL AND finished=0
-            ORDER BY event, kickoff_time, id
-            LIMIT 300
-        """, (event,))
-        fixtures_by_team = defaultdict(list)
-        for fixture in (dict(row) for row in fixture_rows):
-            fixtures_by_team[fixture["team_h"]].append(fixture)
-            fixtures_by_team[fixture["team_a"]].append(fixture)
+        projection_context = await projections.build_projection_context(database, event, horizon)
+        fixtures_by_team = projection_context["fixtures_by_team"]
+        availability_state = projection_context
 
         squad_lookup = {player["player_id"]: player for player in squad}
         sell_ids = []
@@ -1075,6 +1071,7 @@ async def simulate_transfer_plan(
                 base_team_counts,
                 horizon,
                 slot_budget,
+                availability_state,
             )
             spent += row["price"]
             if spent > plan_budget + 1e-9:
@@ -1086,8 +1083,16 @@ async def simulate_transfer_plan(
             xgi_gain += row["breakdown"]["xgi_per90_delta"]
             uses_plan_budget = uses_plan_budget or row["requires_plan_budget"]
 
-        context = await _compute_plan_context(database, squad, event, horizon)
-        sim = await _simulate_transfer_plan(database, squad, context, picks_by_sell_id, event, horizon)
+        context = await _compute_plan_context(database, squad, projection_context["target_event"], horizon)
+        sim = await _simulate_transfer_plan(
+            database,
+            squad,
+            context,
+            picks_by_sell_id,
+            projection_context["target_event"],
+            horizon,
+            projection_context,
+        )
         state = {
             "picks": picks_by_sell_id,
             "spent": spent,
@@ -1137,9 +1142,11 @@ async def simulate_transfer_plan(
             "callouts": sim["callouts"][:4],
             "planning": {
                 "selected_horizon": horizon,
-                "window_start_event": event,
-                "window_end_event": event + horizon - 1,
+                "window_start_event": projection_context["target_event"],
+                "window_end_event": projection_context["target_event"] + horizon - 1,
             },
+            "event": event,
+            "projection_event": projection_context["target_event"],
         }
     finally:
         await database.close()

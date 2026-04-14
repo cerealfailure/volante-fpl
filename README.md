@@ -107,6 +107,16 @@ Main variables:
 - `VOLANTE_INTEL_MANAGER_ID=123456` optional background loop target
 - `VOLANTE_INTEL_HORIZON=5`
 - `VOLANTE_INTEL_INTERVAL_MINUTES=60`
+- `VOLANTE_BACKGROUND_ENABLED=1`
+- `VOLANTE_BACKGROUND_CORE_MINUTES=60`
+- `VOLANTE_BACKGROUND_NEWS_MINUTES=15`
+- `VOLANTE_BACKGROUND_NEWS_WINDOW_HOURS=72`
+- `VOLANTE_BACKGROUND_LIVE_SECONDS=90`
+- `VOLANTE_BACKGROUND_MANAGER_IDS=123456,654321`
+- `VOLANTE_BACKGROUND_MANAGER_MINUTES=30`
+- `VOLANTE_BACKGROUND_MANAGER_TTL_HOURS=24`
+- `VOLANTE_BACKGROUND_PROJECTION_HORIZONS=1,5`
+- `VOLANTE_BACKGROUND_PROJECTION_DELTA=0.2`
 
 See [.env.example](.env.example).
 
@@ -220,6 +230,47 @@ Important:
 - HTTP intel endpoints are not available in `fpl_only`
 
 See [data/external/README.md](data/external/README.md) for CSV rules.
+
+## Background Automation
+
+The API process now includes a built-in background manager. When `VOLANTE_BACKGROUND_ENABLED=1`:
+
+- `bootstrap` and `fixtures` are refreshed automatically
+- availability/news snapshots are captured automatically
+- append-only availability tape rows are stored when the official signal changes
+- live gameweek cache is refreshed every `VOLANTE_BACKGROUND_LIVE_SECONDS` during active matches
+- internal deterministic projection snapshots are persisted into SQLite
+- any manager ID that gets loaded through the app/API is auto-enrolled and kept warm in the background
+- pinned manager IDs from `VOLANTE_BACKGROUND_MANAGER_IDS` are always kept warm
+
+The core poll cadence tightens automatically near the next open fixture:
+
+- normal window: `VOLANTE_BACKGROUND_CORE_MINUTES`
+- news/deadline window: `VOLANTE_BACKGROUND_NEWS_MINUTES`
+
+Check health with:
+
+```bash
+curl http://127.0.0.1:8555/api/status
+```
+
+The response now includes:
+
+- `background.ready`
+- `background.jobs.core`
+- `background.jobs.live`
+- `background.jobs.managers`
+- `background.active_manager_ids`
+
+By default, dynamically loaded manager IDs stay warm for `VOLANTE_BACKGROUND_MANAGER_TTL_HOURS` after last use.
+
+For manager auto-refresh, set:
+
+```bash
+export VOLANTE_BACKGROUND_MANAGER_IDS=123456
+```
+
+If you also run internal intel, the intel manager ID is automatically included in the background manager-refresh set.
 
 ## Transfer Planner Notes
 

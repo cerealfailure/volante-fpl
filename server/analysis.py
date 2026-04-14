@@ -15,6 +15,7 @@ factors. The covariance matrix captures this shared fate.
 import numpy as np
 from collections import Counter, defaultdict
 import db
+import projections
 
 # ── Position labels ──────────────────────────────────────────────────
 POS_NAMES = {1: "GK", 2: "DEF", 3: "MID", 4: "FWD"}
@@ -664,6 +665,8 @@ async def compute_correlation_attribution(
             event = await db.get_current_event(database)
         if event is None:
             raise ValueError("No current event found — sync data first")
+        projection_context = await projections.build_projection_context(database, event, 1)
+        projection_event = projection_context["target_event"]
 
         squad = await db.get_manager_squad(database, manager_id, event)
         if not squad:
@@ -1014,6 +1017,9 @@ async def team_xray(
             event = await db.get_current_event(database)
         if event is None:
             raise ValueError("No current event found — sync data first")
+        projection_horizon = future_weeks if future_weeks is not None and future_weeks > 0 else 1
+        projection_context = await projections.build_projection_context(database, event, projection_horizon)
+        projection_event = projection_context["target_event"]
 
         # 1. load squad
         squad = await db.get_manager_squad(database, manager_id, event)
@@ -1049,13 +1055,13 @@ async def team_xray(
             fixture_cov = await compute_forward_fixture_covariance(
                 starter_ids,
                 database,
-                event,
+                projection_event,
                 future_weeks,
             )
             cov_matrix = ledoit_wolf_shrinkage(cov_matrix, fixture_cov, alpha=FIXTURE_FORECAST_ALPHA)
             window_type = "future"
             window_label = f"Next {future_weeks} GWs"
-            window_summary = f"Fixture-adjusted forecast from GW{event} to GW{event + future_weeks - 1}."
+            window_summary = f"Fixture-adjusted forecast from GW{projection_event} to GW{projection_event + future_weeks - 1}."
             forecast_alpha = FIXTURE_FORECAST_ALPHA
 
         # 5. exposure metrics
@@ -1065,7 +1071,7 @@ async def team_xray(
         callouts = generate_risk_callouts(starters, exposure, cov_matrix)
 
         # 7. fixture outlook (all 15 players)
-        fixture_outlook = await compute_fixture_outlook(squad, database, event)
+        fixture_outlook = await compute_fixture_outlook(squad, database, projection_event)
 
         # 8. load manager info
         mgr_rows = await database.execute_fetchall(
@@ -1073,9 +1079,13 @@ async def team_xray(
         )
         mgr_info = dict(mgr_rows[0]) if mgr_rows else {}
 
+        player_projections = projections.project_players(squad, projection_context, projection_horizon)
+
         # build player cards
         player_cards = []
         for s in squad:
+            projection = player_projections.get(s["player_id"], {})
+            availability = projection.get("availability", {})
             card = {
                 "id": s["player_id"],
                 "web_name": s["web_name"],
@@ -1088,6 +1098,14 @@ async def team_xray(
                 "total_points": s["total_points"],
                 "form": s["form"],
                 "ep_next": s["ep_next"],
+                "projected_ep_next": projection.get("next_event_ep"),
+                "projected_ep_window": projection.get("horizon_ep"),
+                "projection_event": projection_event,
+                "expected_minutes_next": projection.get("expected_minutes_next"),
+                "projection_model": projection.get("model_version"),
+                "projection_uncertainty": availability.get("uncertainty"),
+                "projection_availability": availability,
+                "projection_fixtures": projection.get("per_fixture", []),
                 "selected_pct": s["selected_pct"],
                 "xg": s["xg"],
                 "xa": s["xa"],
@@ -1114,6 +1132,7 @@ async def team_xray(
                 "is_starter": s["squad_position"] <= 11,
                 "squad_position": s["squad_position"],
                 "status": s["status"],
+                "chance_next": s.get("chance_next"),
                 "news": s["news"],
             }
             player_cards.append(card)
@@ -1129,6 +1148,7 @@ async def team_xray(
                 "team_value": (mgr_info.get("team_value") or 0) / 10,
             },
             "event": event,
+            "projection_event": projection_event,
             "players": player_cards,
             "exposure": exposure,
             "callouts": callouts,
@@ -1142,8 +1162,11 @@ async def team_xray(
                 "window_label": window_label,
                 "window_summary": window_summary,
                 "future_weeks": future_weeks,
-                "window_start_event": event if future_weeks else None,
-                "window_end_event": (event + future_weeks - 1) if future_weeks else None,
+                "window_start_event": projection_event if future_weeks else projection_event,
+                "window_end_event": (projection_event + future_weeks - 1) if future_weeks else projection_event,
+                "projection_event": projection_event,
+                "projection_horizon": projection_horizon,
+                "projection_model": projection_context["model_version"],
                 "starters": len(starters),
                 "bench": len(bench),
             },
@@ -1249,7 +1272,21 @@ async def simulate_transfer(
             exp_new = compute_exposure_metrics(proposed_ids, proposed_starters, cov_new, captain_idx)
 
         # compute deltas
-        ep_delta = (player_in.get("ep_next") or 0) - (out_player.get("ep_next") or 0)
+        player_in_projection = projections.project_player(
+            player_in,
+            projection_context["fixtures_by_team"],
+            1,
+            event,
+            projection_context,
+        )
+        out_player_projection = projections.project_player(
+            out_player,
+            projection_context["fixtures_by_team"],
+            1,
+            event,
+            projection_context,
+        )
+        ep_delta = player_in_projection["next_event_ep"] - out_player_projection["next_event_ep"]
         correlation_changes = []
         if out_is_starter and swap_idx is not None:
             current_corr = exp_cur["correlation_matrix"]
@@ -1274,6 +1311,7 @@ async def simulate_transfer(
                 "team_short": out_player["team_short"],
                 "price": out_player["now_cost"] / 10 if out_player["now_cost"] else 0,
                 "ep_next": out_player.get("ep_next"),
+                "projected_ep_next": out_player_projection["next_event_ep"],
             },
             "player_in": {
                 "id": player_in_id,
@@ -1281,6 +1319,7 @@ async def simulate_transfer(
                 "team_short": player_in_team["short_name"] if player_in_team else "???",
                 "price": player_in["now_cost"] / 10 if player_in["now_cost"] else 0,
                 "ep_next": player_in.get("ep_next"),
+                "projected_ep_next": player_in_projection["next_event_ep"],
             },
             "current": {
                 "portfolio_std": exp_cur["portfolio_std"],
@@ -1301,6 +1340,7 @@ async def simulate_transfer(
                 "diversification_ratio": round(exp_new["diversification_ratio"] - exp_cur["diversification_ratio"], 2),
                 "ep_next": round(ep_delta, 1) if ep_delta else 0,
             },
+            "projection_event": projection_event,
             "correlation_changes": correlation_changes[:6],
             "callouts": generate_risk_callouts(proposed_starters, exp_new, cov_new),
         }

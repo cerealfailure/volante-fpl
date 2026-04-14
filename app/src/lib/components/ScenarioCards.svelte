@@ -17,6 +17,7 @@
     players: any[];
     exposure: any;
   } = $props();
+  const displayEp = (player: any) => player?.projected_ep_next ?? player?.projected_ep_window ?? player?.ep_next ?? 0;
 
   let captain = $derived(players.find((p: any) => p.is_captain));
   let topVarTeam = $derived.by(() => {
@@ -28,7 +29,7 @@
   let baseEp = $derived.by(() => {
     return players.reduce((s: number, p: any) => {
       const w = p.is_captain ? 2 : 1;
-      return s + w * (p.ep_next ?? 0);
+      return s + w * displayEp(p);
     }, 0);
   });
 

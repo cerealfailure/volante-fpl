@@ -18,6 +18,7 @@ Tables:
 import aiosqlite
 import os
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DB_PATH = Path(os.environ.get("FULCRUM_DB", Path.home() / ".fulcrum" / "fulcrum.db"))
@@ -325,6 +326,75 @@ CREATE TABLE IF NOT EXISTS alert_delivery_targets (
     updated_at      TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS player_availability_snapshots (
+    target_event         INTEGER NOT NULL,
+    player_id            INTEGER REFERENCES players(id),
+    snapshot_at          TEXT NOT NULL,
+    team_id              INTEGER REFERENCES teams(id),
+    status               TEXT,
+    chance_next          INTEGER,
+    news                 TEXT,
+    news_category        TEXT,
+    news_severity        REAL DEFAULT 0,
+    news_purity          REAL DEFAULT 0,
+    listed_play_prob     REAL,
+    listed_start_prob    REAL,
+    expected_minutes     REAL,
+    model_version        TEXT,
+    PRIMARY KEY (target_event, player_id)
+);
+
+CREATE TABLE IF NOT EXISTS player_availability_tape (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    target_event         INTEGER NOT NULL,
+    player_id            INTEGER REFERENCES players(id),
+    snapshot_at          TEXT NOT NULL,
+    snapshot_kind        TEXT NOT NULL,
+    snapshot_reason      TEXT,
+    changed_fields       TEXT,
+    team_id              INTEGER REFERENCES teams(id),
+    status               TEXT,
+    chance_next          INTEGER,
+    news                 TEXT,
+    news_category        TEXT,
+    news_severity        REAL DEFAULT 0,
+    news_purity          REAL DEFAULT 0,
+    listed_play_prob     REAL,
+    listed_start_prob    REAL,
+    expected_minutes     REAL,
+    model_version        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS availability_profiles (
+    as_of_event          INTEGER NOT NULL,
+    team_id              INTEGER DEFAULT 0,
+    status               TEXT NOT NULL,
+    chance_bucket        TEXT NOT NULL,
+    news_category        TEXT NOT NULL,
+    sample_size          INTEGER DEFAULT 0,
+    listed_play_rate     REAL DEFAULT 0,
+    actual_play_rate     REAL DEFAULT 0,
+    listed_start_rate    REAL DEFAULT 0,
+    actual_start_rate    REAL DEFAULT 0,
+    listed_minutes       REAL DEFAULT 0,
+    actual_minutes       REAL DEFAULT 0,
+    play_bias            REAL DEFAULT 0,
+    start_bias           REAL DEFAULT 0,
+    mean_abs_error       REAL DEFAULT 0,
+    honesty_score        REAL DEFAULT 0,
+    updated_at           TEXT NOT NULL,
+    PRIMARY KEY (as_of_event, team_id, status, chance_bucket, news_category)
+);
+
+CREATE TABLE IF NOT EXISTS background_manager_registry (
+    manager_id      INTEGER PRIMARY KEY,
+    source          TEXT,
+    pinned          INTEGER DEFAULT 0,
+    last_seen_at    TEXT NOT NULL,
+    last_warmed_at  TEXT,
+    meta            TEXT
+);
+
 CREATE INDEX IF NOT EXISTS idx_player_gws_player ON player_gws(player_id);
 CREATE INDEX IF NOT EXISTS idx_player_gws_event ON player_gws(event);
 CREATE INDEX IF NOT EXISTS idx_players_team ON players(team_id);
@@ -337,6 +407,11 @@ CREATE INDEX IF NOT EXISTS idx_manager_transfers_mgr ON manager_transfers(manage
 CREATE INDEX IF NOT EXISTS idx_projection_snapshots_lookup ON projection_snapshots(event, horizon, player_id, source_key, snapshot_at);
 CREATE INDEX IF NOT EXISTS idx_intel_runs_mgr ON intel_runs(manager_id, event, created_at);
 CREATE INDEX IF NOT EXISTS idx_intel_alerts_mgr ON intel_alerts(manager_id, event, delivery_status, created_at);
+CREATE INDEX IF NOT EXISTS idx_availability_snapshots_lookup ON player_availability_snapshots(target_event, team_id, status, chance_next);
+CREATE INDEX IF NOT EXISTS idx_availability_tape_lookup ON player_availability_tape(target_event, player_id, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_availability_tape_kind ON player_availability_tape(snapshot_kind, snapshot_at DESC);
+CREATE INDEX IF NOT EXISTS idx_availability_profiles_lookup ON availability_profiles(as_of_event, team_id, status, chance_bucket, news_category);
+CREATE INDEX IF NOT EXISTS idx_background_manager_registry_seen ON background_manager_registry(pinned, last_seen_at DESC);
 """
 
 
@@ -660,6 +735,29 @@ async def get_current_event(db: aiosqlite.Connection) -> int | None:
     return None
 
 
+async def get_next_open_event(db: aiosqlite.Connection, from_event: int | None = None) -> int | None:
+    """Get the next event with unfinished fixtures."""
+    params: list = []
+    where = "WHERE event IS NOT NULL AND finished=0"
+    if from_event is not None:
+        where += " AND event >= ?"
+        params.append(from_event)
+
+    rows = await db.execute_fetchall(
+        f"""
+        SELECT event
+        FROM fixtures
+        {where}
+        ORDER BY event, kickoff_time, id
+        LIMIT 1
+        """,
+        params,
+    )
+    if rows:
+        return rows[0]["event"]
+    return from_event if from_event is not None else await get_current_event(db)
+
+
 async def get_player(db: aiosqlite.Connection, player_id: int) -> dict | None:
     rows = await db.execute_fetchall("SELECT * FROM players WHERE id=?", (player_id,))
     return dict(rows[0]) if rows else None
@@ -691,7 +789,7 @@ async def get_manager_squad(db: aiosqlite.Connection, manager_id: int, event: in
                p.web_name, p.team_id, p.position as pos_type,
                p.now_cost, p.total_points, p.form, p.ep_next, p.selected_pct,
                p.xg, p.xa, p.xgi, p.xgc, p.minutes, p.goals_scored, p.assists,
-               p.clean_sheets, p.goals_conceded, p.bonus, p.status, p.news,
+               p.clean_sheets, p.goals_conceded, p.bonus, p.status, p.chance_next, p.news,
                p.influence, p.creativity, p.threat, p.ict_index,
                p.xg_per90, p.xa_per90, p.xgi_per90, p.starts,
                p.penalties_order, p.corners_order,
@@ -773,10 +871,37 @@ async def get_upcoming_fixtures(db: aiosqlite.Connection, team_id: int, from_eve
         FROM fixtures f
         JOIN teams th ON f.team_h = th.id
         JOIN teams ta ON f.team_a = ta.id
-        WHERE (f.team_h=? OR f.team_a=?) AND f.event >= ? AND f.event IS NOT NULL
+        WHERE (f.team_h=? OR f.team_a=?)
+          AND f.event >= ?
+          AND f.event IS NOT NULL
+          AND f.finished=0
         ORDER BY f.event LIMIT ?
     """, (team_id, team_id, from_event, n))
     return [dict(r) for r in rows]
+
+
+async def get_next_open_fixture(db: aiosqlite.Connection, from_event: int | None = None) -> dict | None:
+    params: list = []
+    where = "WHERE f.event IS NOT NULL AND f.finished=0"
+    if from_event is not None:
+        where += " AND f.event >= ?"
+        params.append(from_event)
+
+    rows = await db.execute_fetchall(
+        f"""
+        SELECT f.*,
+               th.short_name as home_short, ta.short_name as away_short,
+               th.name as home_name, ta.name as away_name
+        FROM fixtures f
+        JOIN teams th ON f.team_h = th.id
+        JOIN teams ta ON f.team_a = ta.id
+        {where}
+        ORDER BY f.event, f.kickoff_time, f.id
+        LIMIT 1
+        """,
+        params,
+    )
+    return dict(rows[0]) if rows else None
 
 
 async def get_team_fixtures_in_window(
@@ -794,6 +919,7 @@ async def get_team_fixtures_in_window(
         JOIN teams ta ON f.team_a = ta.id
         WHERE (f.team_h=? OR f.team_a=?)
           AND f.event IS NOT NULL
+          AND f.finished=0
           AND f.event BETWEEN ? AND ?
         ORDER BY f.event, f.kickoff_time, f.id
     """, (team_id, team_id, from_event, to_event))
@@ -980,13 +1106,17 @@ async def get_latest_projection_rows(
     event: int,
     horizon: int,
     player_ids: list[int] | None = None,
+    source_key: str | None = None,
 ) -> list[dict]:
     params: list = [event, horizon]
     filter_sql = ""
     if player_ids:
         placeholders = ",".join("?" * len(player_ids))
-        filter_sql = f" AND player_id IN ({placeholders})"
+        filter_sql += f" AND player_id IN ({placeholders})"
         params.extend(player_ids)
+    if source_key:
+        filter_sql += " AND source_key=?"
+        params.append(source_key)
 
     rows = await conn.execute_fetchall(f"""
         SELECT *
@@ -1146,7 +1276,209 @@ async def get_alert_delivery_targets(conn: aiosqlite.Connection, enabled_only: b
     return result
 
 
-from datetime import datetime, timezone
+async def upsert_availability_snapshots(conn: aiosqlite.Connection, rows: list[dict]):
+    if not rows:
+        return
+    await conn.executemany("""
+        INSERT OR REPLACE INTO player_availability_snapshots
+        (target_event, player_id, snapshot_at, team_id, status, chance_next, news,
+         news_category, news_severity, news_purity, listed_play_prob, listed_start_prob,
+         expected_minutes, model_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [(
+        row["target_event"],
+        row["player_id"],
+        row["snapshot_at"],
+        row["team_id"],
+        row.get("status"),
+        row.get("chance_next"),
+        row.get("news"),
+        row.get("news_category"),
+        row.get("news_severity"),
+        row.get("news_purity"),
+        row.get("listed_play_prob"),
+        row.get("listed_start_prob"),
+        row.get("expected_minutes"),
+        row.get("model_version"),
+    ) for row in rows])
+
+
+async def append_availability_tape(conn: aiosqlite.Connection, rows: list[dict]):
+    if not rows:
+        return
+    await conn.executemany("""
+        INSERT INTO player_availability_tape
+        (target_event, player_id, snapshot_at, snapshot_kind, snapshot_reason, changed_fields,
+         team_id, status, chance_next, news, news_category, news_severity, news_purity,
+         listed_play_prob, listed_start_prob, expected_minutes, model_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [(
+        row["target_event"],
+        row["player_id"],
+        row["snapshot_at"],
+        row.get("snapshot_kind") or "poll",
+        row.get("snapshot_reason"),
+        _json_dump(row.get("changed_fields")),
+        row["team_id"],
+        row.get("status"),
+        row.get("chance_next"),
+        row.get("news"),
+        row.get("news_category"),
+        row.get("news_severity"),
+        row.get("news_purity"),
+        row.get("listed_play_prob"),
+        row.get("listed_start_prob"),
+        row.get("expected_minutes"),
+        row.get("model_version"),
+    ) for row in rows])
+
+
+async def get_latest_availability_snapshots(
+    conn: aiosqlite.Connection,
+    target_event: int,
+    player_ids: list[int] | None = None,
+) -> dict[int, dict]:
+    params: list = [target_event]
+    filter_sql = ""
+    if player_ids:
+        placeholders = ",".join("?" * len(player_ids))
+        filter_sql = f" AND player_id IN ({placeholders})"
+        params.extend(player_ids)
+    rows = await conn.execute_fetchall(f"""
+        SELECT *
+        FROM player_availability_snapshots
+        WHERE target_event=? {filter_sql}
+    """, params)
+    return {row["player_id"]: dict(row) for row in rows}
+
+
+async def upsert_availability_profiles(
+    conn: aiosqlite.Connection,
+    as_of_event: int,
+    rows: list[dict],
+):
+    if not rows:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.executemany("""
+        INSERT OR REPLACE INTO availability_profiles
+        (as_of_event, team_id, status, chance_bucket, news_category, sample_size,
+         listed_play_rate, actual_play_rate, listed_start_rate, actual_start_rate,
+         listed_minutes, actual_minutes, play_bias, start_bias, mean_abs_error,
+         honesty_score, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, [(
+        as_of_event,
+        row.get("team_id", 0),
+        row["status"],
+        row["chance_bucket"],
+        row["news_category"],
+        row["sample_size"],
+        row.get("listed_play_rate"),
+        row.get("actual_play_rate"),
+        row.get("listed_start_rate"),
+        row.get("actual_start_rate"),
+        row.get("listed_minutes"),
+        row.get("actual_minutes"),
+        row.get("play_bias"),
+        row.get("start_bias"),
+        row.get("mean_abs_error"),
+        row.get("honesty_score"),
+        now,
+    ) for row in rows])
+
+
+async def get_availability_profiles(conn: aiosqlite.Connection, as_of_event: int) -> list[dict]:
+    rows = await conn.execute_fetchall("""
+        SELECT MAX(as_of_event) as effective_event
+        FROM availability_profiles
+        WHERE as_of_event <= ?
+    """, (as_of_event,))
+    effective_event = rows[0]["effective_event"] if rows else None
+    if effective_event is None:
+        return []
+
+    profile_rows = await conn.execute_fetchall("""
+        SELECT *
+        FROM availability_profiles
+        WHERE as_of_event = ?
+        ORDER BY team_id, status, chance_bucket, news_category
+    """, (effective_event,))
+    return [dict(row) for row in profile_rows]
+
+
+async def touch_background_manager(
+    conn: aiosqlite.Connection,
+    manager_id: int,
+    source: str = "api",
+    pinned: bool = False,
+    meta: dict | None = None,
+):
+    now = datetime.now(timezone.utc).isoformat()
+    await conn.execute("""
+        INSERT INTO background_manager_registry
+        (manager_id, source, pinned, last_seen_at, last_warmed_at, meta)
+        VALUES (?, ?, ?, ?, NULL, ?)
+        ON CONFLICT(manager_id) DO UPDATE SET
+            source=excluded.source,
+            pinned=CASE
+                WHEN background_manager_registry.pinned = 1 OR excluded.pinned = 1 THEN 1
+                ELSE 0
+            END,
+            last_seen_at=excluded.last_seen_at,
+            meta=CASE
+                WHEN excluded.meta IS NOT NULL THEN excluded.meta
+                ELSE background_manager_registry.meta
+            END
+    """, (
+        manager_id,
+        source,
+        1 if pinned else 0,
+        now,
+        _json_dump(meta),
+    ))
+
+
+async def list_background_managers(
+    conn: aiosqlite.Connection,
+    max_age_hours: int = 24,
+    include_pinned: bool = True,
+) -> list[dict]:
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max(max_age_hours, 1))).isoformat()
+    where = "WHERE last_seen_at >= ?"
+    params: list = [cutoff]
+    if include_pinned:
+        where = "WHERE pinned = 1 OR last_seen_at >= ?"
+
+    rows = await conn.execute_fetchall(f"""
+        SELECT *
+        FROM background_manager_registry
+        {where}
+        ORDER BY pinned DESC, last_seen_at DESC, manager_id
+    """, params)
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["pinned"] = bool(item.get("pinned"))
+        if item.get("meta"):
+            item["meta"] = json.loads(item["meta"])
+        result.append(item)
+    return result
+
+
+async def mark_background_managers_warmed(
+    conn: aiosqlite.Connection,
+    manager_ids: list[int],
+    warmed_at: str | None = None,
+):
+    if not manager_ids:
+        return
+    stamp = warmed_at or datetime.now(timezone.utc).isoformat()
+    await conn.executemany("""
+        UPDATE background_manager_registry
+        SET last_warmed_at=?
+        WHERE manager_id=?
+    """, [(stamp, manager_id) for manager_id in manager_ids])
 
 
 def _json_dump(value) -> str | None:
