@@ -103,7 +103,7 @@
     if (selectedPlayer?.id === p.id) { selectedPlayer = null; playerDetail = null; return; }
     selectedPlayer = p; loadingPlayer = true;
     gaffer.say(
-      `${p.web_name.toUpperCase()} · ${p.team_short} ${p.position} · ${p.ep_next?.toFixed(1) ?? '—'} EP · ${p.form?.toFixed(1) ?? '—'} FORM.`
+      `${p.web_name.toUpperCase()} · ${p.team_short} ${p.position} · ${displayEp(p)?.toFixed(1) ?? '—'} XP · ${p.form?.toFixed(1) ?? '—'} FORM.`
     );
     try {
       playerDetail = await getPlayerDetail($managerId!, p.id);
@@ -120,6 +120,8 @@
   let defs = $derived(starters.filter((p: any) => p.pos_type === 2));
   let mids = $derived(starters.filter((p: any) => p.pos_type === 3));
   let fwds = $derived(starters.filter((p: any) => p.pos_type === 4));
+  const displayEp = (player: any) => player?.projected_ep_next ?? player?.projected_ep_window ?? player?.ep_next ?? player?.form ?? 2;
+  let projectionEvent = $derived(data?.projection_event ?? data?.meta?.projection_event ?? data?.event);
 
   // formation string, e.g. "3-4-3"
   let formation = $derived(`${defs.length}-${mids.length}-${fwds.length}`);
@@ -140,7 +142,7 @@
   let squadEP = $derived.by(() => {
     if (!starters.length) return 0;
     return starters.reduce((sum: number, p: any) => {
-      const ep = p.ep_next ?? p.form ?? 2;
+      const ep = displayEp(p);
       return sum + ep * (p.is_captain ? 2 : 1);
     }, 0);
   });
@@ -148,10 +150,10 @@
   let benchWaste = $derived.by(() => {
     if (!starters.length || !bench.length) return [];
     const worst = starters.reduce((w: any, p: any) =>
-      ((p.ep_next ?? p.form ?? 99) < (w.ep_next ?? w.form ?? 99)) ? p : w, starters[0]);
-    const wEP = worst.ep_next ?? worst.form ?? 2;
-    return bench.filter((b: any) => (b.ep_next ?? b.form ?? 0) > wEP + 0.3)
-      .map((b: any) => ({ bench: b, benchEP: b.ep_next ?? b.form ?? 0, starter: worst, starterEP: wEP, diff: (b.ep_next ?? b.form ?? 0) - wEP }));
+      (displayEp(p) < displayEp(w)) ? p : w, starters[0]);
+    const wEP = displayEp(worst);
+    return bench.filter((b: any) => displayEp(b) > wEP + 0.3)
+      .map((b: any) => ({ bench: b, benchEP: displayEp(b), starter: worst, starterEP: wEP, diff: displayEp(b) - wEP }));
   });
   let flaggedStarters = $derived(starters.filter((p: any) => p.status && p.status !== 'a'));
   let squadTrend = $derived.by(() => {
@@ -173,7 +175,7 @@
     const id = data.manager?.id ?? $managerId;
     if (greetedForId === id) return;
     greetedForId = id;
-    gaffer.say(`GW${data.event} LOADED.`);
+    gaffer.say(`GW${projectionEvent} PROJECTIONS LOADED.`);
   });
 
   function lookbackKey(value: number | null) {
@@ -445,7 +447,7 @@
       <div class="mgr-identity">
         <span class="eyebrow">
           <Icon.Jersey size={12} />
-          MANAGER #{data.manager.id ?? $managerId} · GW{data.event}
+          MANAGER #{data.manager.id ?? $managerId} · Squad GW{data.event} · Proj GW{projectionEvent}
         </span>
         <h1 class="display">{data.manager.name || 'My Team'}</h1>
         <p class="dim mgr-name">{data.manager.player_name}</p>
@@ -565,7 +567,7 @@
             <div class="xi-hero">
               <div class="xi-hero-copy">
                 <span class="stat-value">{squadEP.toFixed(1)}</span>
-                <span class="eyebrow">Expected points · GW{data.event}</span>
+                <span class="eyebrow">Expected points · GW{projectionEvent}</span>
               </div>
               {#if squadTrend.length}
                 <div class="xi-sparkline" aria-label="Last 5 gameweeks actual points vs expected points">
@@ -614,7 +616,7 @@
               >
                 <span class="bp-name">{p.web_name}</span>
                 <span class="bp-team dim2">{p.team_short}</span>
-                <span class="bp-ep mono">{p.ep_next?.toFixed(1) ?? '—'}</span>
+                <span class="bp-ep mono">{displayEp(p)?.toFixed(1) ?? '—'}</span>
               </button>
             {/each}
           </div>
@@ -631,7 +633,7 @@
             <span class="badge badge-accent">{selectedPlayer.team_short} · {selectedPlayer.position}</span>
           </div>
           <div class="detail-stats">
-            <div class="ds ep"><span class="mono accent">{selectedPlayer.ep_next?.toFixed(1) ?? '—'}</span><StatExplainer term="EP" /></div>
+            <div class="ds ep"><span class="mono accent">{displayEp(selectedPlayer)?.toFixed(1) ?? '—'}</span><StatExplainer term="EP" /></div>
             <div class="ds"><span class="mono">{selectedPlayer.total_points}</span><span class="stat-label">Pts</span></div>
             <div class="ds"><span class="mono">{selectedPlayer.form?.toFixed(1)}</span><StatExplainer term="Form" /></div>
             <div class="ds"><span class="mono">£{selectedPlayer.price?.toFixed(1)}m</span><span class="stat-label">Price</span></div>
@@ -644,6 +646,14 @@
             <div class="ds"><span class="mono">{selectedPlayer.minutes}</span><span class="stat-label">Mins</span></div>
             <div class="ds"><span class="mono">{selectedPlayer.ict_index?.toFixed(1) ?? '—'}</span><StatExplainer term="ICT" /></div>
           </div>
+
+          {#if selectedPlayer.projection_availability}
+            <div class="detail-note dim2 small">
+              Modelled for GW{projectionEvent}. Expected minutes {selectedPlayer.expected_minutes_next?.toFixed(0) ?? '—'},
+              availability reliability {(selectedPlayer.projection_availability.reliability_score * 100).toFixed(0)}%,
+              official FPL EP {selectedPlayer.ep_next?.toFixed(1) ?? '—'}.
+            </div>
+          {/if}
 
           {#if loadingPlayer}<p class="dim small loading">Loading…</p>{/if}
 
@@ -695,7 +705,7 @@
         <Icon.Stopwatch size={14} /> Open Fixtures
       </button>
       <button class="atab" class:active={analysisTab === 'portfolio'} onclick={() => setAnalysisTab('portfolio')}>
-        <Icon.Goal size={14} /> GW{(data?.event ?? 0) + 1 <= 38 ? (data?.event ?? 0) + 1 : data?.event} Outlook
+        <Icon.Goal size={14} /> GW{projectionEvent} Outlook
       </button>
       <button class="atab" class:active={analysisTab === 'deep'} onclick={() => setAnalysisTab('deep')}>
         <Icon.Jersey size={14} /> What Landed
@@ -767,7 +777,7 @@
           <h2>Fixture Outlook</h2>
           <span class="dim2 small">Next 6 GWs</span>
         </div>
-        <FixtureStrip outlook={data.fixture_outlook} currentEvent={data.event} />
+        <FixtureStrip outlook={data.fixture_outlook} currentEvent={projectionEvent} />
       </section>
 
     {:else if analysisTab === 'portfolio'}
@@ -1457,6 +1467,11 @@
   .ds.ep .mono {
     font-size: 1.2rem;
     letter-spacing: -0.02em;
+  }
+  .detail-note {
+    margin-top: -0.2rem;
+    margin-bottom: 0.6rem;
+    line-height: 1.45;
   }
 
   .detail-section {

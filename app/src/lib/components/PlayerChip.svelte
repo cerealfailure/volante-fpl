@@ -22,6 +22,7 @@
   } = $props();
 
   let kit = $derived(kitFor(player.team_short));
+  let chipEp = $derived(player.projected_ep_next ?? player.projected_ep ?? player.ep_next);
 
   // Fallback "shirt back" when squad_number isn't provided —
   // use first three chars of web_name, uppercase.
@@ -31,7 +32,7 @@
       : (player.web_name ?? '').slice(0, 3).toUpperCase()
   );
   let epDelta = $derived(
-    averageEp == null || player.ep_next == null ? null : player.ep_next - averageEp
+    averageEp == null || chipEp == null ? null : chipEp - averageEp
   );
 </script>
 
@@ -73,7 +74,7 @@
   </span>
 
   <span class="chip-name">{player.web_name}</span>
-  <span class="chip-ep mono">{player.ep_next?.toFixed(1) ?? '—'} EP</span>
+  <span class="chip-ep mono">{chipEp?.toFixed(1) ?? '—'} EP</span>
   {#if epDelta != null}
     <span class="chip-delta mono" class:positive={epDelta > 0.05} class:negative={epDelta < -0.05}>
       {epDelta > 0 ? '+' : ''}{epDelta.toFixed(1)} vs avg

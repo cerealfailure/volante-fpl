@@ -30,6 +30,7 @@ import analysis
 import fixture_exposure
 import intel as intel_engine
 import transfers as transfers_engine
+import background
 
 VOLANTE_MODE = os.environ.get("VOLANTE_MODE", "fpl_only").strip().lower()
 if VOLANTE_MODE not in {"fpl_only", "overall"}:
@@ -69,6 +70,7 @@ def _require_intel_access(request: Request):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await db.init_db()
+    await background.manager.start()
     if _internal_mode_enabled():
         conn = await db.get_db()
         try:
@@ -89,6 +91,7 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
+        await background.manager.stop()
         if intel_task is not None:
             intel_task.cancel()
             try:
@@ -175,6 +178,13 @@ def _synced_at(sync: dict | None) -> str | None:
     return sync["synced_at"] if sync else None
 
 
+async def _register_background_manager(manager_id: int, source: str):
+    try:
+        await background.manager.register_manager(manager_id, source=source)
+    except Exception:
+        pass
+
+
 # ── Sync ─────────────────────────────────────────────────────────────
 
 @app.post("/api/sync")
@@ -193,6 +203,7 @@ async def sync_manager(req: SyncManagerRequest):
     try:
         await _ensure_core_cache()
         result = await fpl.sync_manager(req.manager_id)
+        await _register_background_manager(req.manager_id, "sync_manager")
         return {"ok": True, **result}
     except fpl.FplError as e:
         raise _http_from_fpl_error(e)
@@ -232,6 +243,7 @@ async def team_xray(
             lookback=lookback,
             future_weeks=future_weeks,
         )
+        await _register_background_manager(manager_id, "xray")
         return result
     except ValueError as e:
         raise HTTPException(404, str(e))
@@ -264,7 +276,9 @@ async def correlation_attribution(
                 if not squad:
                     raise _http_from_fpl_error(exc)
 
-        return await analysis.compute_correlation_attribution(manager_id, lookback=lookback, event=event)
+        result = await analysis.compute_correlation_attribution(manager_id, lookback=lookback, event=event)
+        await _register_background_manager(manager_id, "attribution")
+        return result
     except ValueError as e:
         raise HTTPException(404, str(e))
     except Exception as e:
@@ -346,7 +360,7 @@ async def player_deep_dive(manager_id: int, player_id: int, event: int | None = 
                 "is_home": is_home,
             })
 
-        return {
+        result = {
             "player": {
                 "id": player["id"],
                 "web_name": player["web_name"],
@@ -370,6 +384,8 @@ async def player_deep_dive(manager_id: int, player_id: int, event: int | None = 
             "correlations": correlations,
             "fixtures": fix_outlook,
         }
+        await _register_background_manager(manager_id, "player_deep_dive")
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -383,6 +399,7 @@ async def simulate_transfer(manager_id: int, req: TransferSimRequest, event: int
     """Simulate swapping one player for another — returns variance/exposure delta."""
     try:
         result = await analysis.simulate_transfer(manager_id, req.player_out, req.player_in, event)
+        await _register_background_manager(manager_id, "simulate_transfer")
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -402,6 +419,7 @@ async def simulate_transfer_plan(manager_id: int, req: TransferPlanSimRequest):
             event=req.event,
             horizon=req.horizon,
         )
+        await _register_background_manager(manager_id, "simulate_plan")
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -509,7 +527,9 @@ async def status(manager_id: int | None = None):
         for table in [
             "teams", "players", "fixtures", "player_gws", "manager_picks",
             "manager_leagues", "league_pages", "league_standings", "manager_transfers",
-            "ep_snapshots", "live_gw_cache",
+            "ep_snapshots", "live_gw_cache", "projection_snapshots",
+            "player_availability_snapshots", "player_availability_tape", "availability_profiles",
+            "background_manager_registry",
         ]:
             rows = await conn.execute_fetchall(f"SELECT count(*) as c FROM {table}")
             counts[table] = rows[0]["c"]
@@ -527,6 +547,7 @@ async def status(manager_id: int | None = None):
                 "fixtures_stale": fpl.is_stale(fixtures_sync, fpl.CORE_DATA_TTL),
             },
             "counts": counts,
+            "background": background.manager.snapshot(),
         }
         if manager_id is not None:
             manager_sync = await db.get_sync(conn, fpl.manager_sync_key(manager_id))
@@ -589,11 +610,13 @@ async def manager_leagues(manager_id: int, refresh: bool = False):
                     raise _http_from_fpl_error(exc)
                 stale = True
 
-        return {
+        result = {
             "leagues": leagues,
             "stale": stale,
             "synced_at": _synced_at(sync),
         }
+        await _register_background_manager(manager_id, "manager_leagues")
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -675,11 +698,13 @@ async def manager_transfers(manager_id: int, refresh: bool = False):
                     raise _http_from_fpl_error(exc)
                 stale = True
 
-        return {
+        result = {
             "transfers": transfers,
             "stale": stale,
             "synced_at": _synced_at(sync),
         }
+        await _register_background_manager(manager_id, "manager_transfers")
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -899,7 +924,7 @@ async def live_gameweek(manager_id: int):
                 "your_points": your_pts,
             })
 
-        return {
+        result = {
             "is_live": is_live,
             "has_started": has_started,
             "event": current_event,
@@ -925,6 +950,8 @@ async def live_gameweek(manager_id: int):
             "players": live_players,
             "fixtures": fixture_summary,
         }
+        await _register_background_manager(manager_id, "live_gameweek")
+        return result
     except HTTPException:
         raise
     except Exception as e:
@@ -1010,7 +1037,9 @@ async def prediction_accuracy(manager_id: int, weeks: int = Query(default=6, ge=
                     "worst_week": max(results, key=lambda r: abs(r["diff"])),
                 }
 
-            return {"weeks": results, "summary": summary}
+            result = {"weeks": results, "summary": summary}
+            await _register_background_manager(manager_id, "prediction_accuracy")
+            return result
         finally:
             await conn.close()
     except Exception as e:
@@ -1075,6 +1104,7 @@ async def recommend_transfers(manager_id: int, req: RecommendRequest):
         result = await transfers_engine.recommend_replacements(
             manager_id, req.sell_ids, n=req.n, horizon=req.horizon,
         )
+        await _register_background_manager(manager_id, "recommend_transfers")
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
@@ -1103,6 +1133,7 @@ async def transfer_analysis(manager_id: int):
                     raise
 
         result = await transfers_engine.analyze_past_transfers(manager_id)
+        await _register_background_manager(manager_id, "transfer_analysis")
         return result
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -1140,13 +1171,15 @@ async def run_private_intel(
     try:
         _require_intel_access(request)
         await _ensure_core_cache()
-        return await intel_engine.run_transfer_intelligence(
+        result = await intel_engine.run_transfer_intelligence(
             manager_id,
             event=event,
             horizon=horizon,
             persist=True,
             deliver=deliver,
         )
+        await _register_background_manager(manager_id, "intel_run")
+        return result
     except ValueError as e:
         raise HTTPException(400, str(e))
     except Exception as e:
@@ -1165,6 +1198,7 @@ async def get_private_intel_alerts(
     try:
         _require_intel_access(request)
         alerts = await intel_engine.list_alerts(manager_id, status=status, limit=limit)
+        await _register_background_manager(manager_id, "intel_alerts")
         return {"alerts": alerts}
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -1195,6 +1229,7 @@ async def squad_fixture_exposure(manager_id: int, event: int | None = None):
                 raise _http_from_fpl_error(exc)
 
         result = await fixture_exposure.gameweek_exposure_report(manager_id, event)
+        await _register_background_manager(manager_id, "fixture_exposure")
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))

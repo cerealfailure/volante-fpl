@@ -18,11 +18,12 @@
     exposure: any;
     freeTransfers?: number;
   } = $props();
+  const displayEp = (player: any) => player?.projected_ep_next ?? player?.projected_ep_window ?? player?.ep_next ?? 0;
 
   // Find the weakest starter by EP
   let weakestStarter = $derived.by(() => {
     const starters = (players ?? []).filter((p: any) => p.is_starter);
-    return [...starters].sort((a: any, b: any) => (a.ep_next ?? 0) - (b.ep_next ?? 0))[0];
+    return [...starters].sort((a: any, b: any) => displayEp(a) - displayEp(b))[0];
   });
 
   // Best-affordable price cap for a replacement: weakest's price + bank
@@ -56,7 +57,7 @@
       this week without taking a hit.
       {#if weakestStarter}
         The weakest slot is <span class="mono">{weakestStarter.web_name}</span>
-        at {weakestStarter.ep_next?.toFixed(1) ?? '—'} EP, giving you a live replacement cap of
+        at {displayEp(weakestStarter)?.toFixed(1) ?? '—'} EP, giving you a live replacement cap of
         <span class="mono">£{priceCap.toFixed(1)}m</span>.
       {/if}
     </p>
