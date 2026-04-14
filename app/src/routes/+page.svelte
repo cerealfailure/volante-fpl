@@ -390,7 +390,7 @@
               inputmode="numeric"
               bind:value={idInput}
               onkeydown={handleKey}
-              placeholder="e.g. 12345"
+              placeholder="your FPL manager ID"
               disabled={loading}
               autocomplete="off"
             />

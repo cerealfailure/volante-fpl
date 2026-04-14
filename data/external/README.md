@@ -40,7 +40,7 @@ Accepted aliases:
 ```
 
 ```bash
-./scripts/run-transfer-intel.sh --manager-id 123456 --horizon 5
+./scripts/run-transfer-intel.sh --manager-id YOUR_MANAGER_ID --horizon 5
 ```
 
 ## Protected HTTP examples
@@ -58,6 +58,6 @@ curl -X POST http://127.0.0.1:8555/api/intel/import-csv \
 ```
 
 ```bash
-curl -X POST "http://127.0.0.1:8555/api/intel/123456/run?horizon=5" \
+curl -X POST "http://127.0.0.1:8555/api/intel/YOUR_MANAGER_ID/run?horizon=5" \
   -H "X-Volante-Token: $VOLANTE_INTEL_TOKEN"
 ```

@@ -104,7 +104,7 @@ Main variables:
 - `VOLANTE_WEB_PORT=5555`
 - `VOLANTE_ALLOW_ORIGIN_REGEX=^https?://[^/]+(?::\\d+)?$`
 - `VOLANTE_INTEL_TOKEN=...` optional, recommended for remote internal access
-- `VOLANTE_INTEL_MANAGER_ID=123456` optional background loop target
+- `VOLANTE_INTEL_MANAGER_ID=YOUR_MANAGER_ID` optional background loop target
 - `VOLANTE_INTEL_HORIZON=5`
 - `VOLANTE_INTEL_INTERVAL_MINUTES=60`
 - `VOLANTE_BACKGROUND_ENABLED=1`
@@ -112,7 +112,7 @@ Main variables:
 - `VOLANTE_BACKGROUND_NEWS_MINUTES=15`
 - `VOLANTE_BACKGROUND_NEWS_WINDOW_HOURS=72`
 - `VOLANTE_BACKGROUND_LIVE_SECONDS=90`
-- `VOLANTE_BACKGROUND_MANAGER_IDS=123456,654321`
+- `VOLANTE_BACKGROUND_MANAGER_IDS=YOUR_MANAGER_ID,ANOTHER_MANAGER_ID`
 - `VOLANTE_BACKGROUND_MANAGER_MINUTES=30`
 - `VOLANTE_BACKGROUND_MANAGER_TTL_HOURS=24`
 - `VOLANTE_BACKGROUND_PROJECTION_HORIZONS=1,5`
@@ -176,20 +176,20 @@ Import a CSV snapshot:
 Run the analyzer:
 
 ```bash
-./scripts/run-transfer-intel.sh --manager-id 123456 --horizon 5
+./scripts/run-transfer-intel.sh --manager-id YOUR_MANAGER_ID --horizon 5
 ```
 
 Read stored alerts:
 
 ```bash
-./scripts/run-transfer-intel.sh --manager-id 123456 --list-alerts
+./scripts/run-transfer-intel.sh --manager-id YOUR_MANAGER_ID --list-alerts
 ```
 
 ### Background Loop
 
 ```bash
 export VOLANTE_MODE=overall
-export VOLANTE_INTEL_MANAGER_ID=123456
+export VOLANTE_INTEL_MANAGER_ID=YOUR_MANAGER_ID
 export VOLANTE_INTEL_HORIZON=5
 export VOLANTE_INTEL_INTERVAL_MINUTES=60
 export VOLANTE_ALERT_STDOUT=1
@@ -205,7 +205,7 @@ Only use these if you need HTTP access to the private analyzer.
 Run an intel pass:
 
 ```bash
-curl -X POST "http://127.0.0.1:8555/api/intel/123456/run?horizon=5" \
+curl -X POST "http://127.0.0.1:8555/api/intel/YOUR_MANAGER_ID/run?horizon=5" \
   -H "X-Volante-Token: $VOLANTE_INTEL_TOKEN"
 ```
 
@@ -267,7 +267,7 @@ By default, dynamically loaded manager IDs stay warm for `VOLANTE_BACKGROUND_MAN
 For manager auto-refresh, set:
 
 ```bash
-export VOLANTE_BACKGROUND_MANAGER_IDS=123456
+export VOLANTE_BACKGROUND_MANAGER_IDS=YOUR_MANAGER_ID
 ```
 
 If you also run internal intel, the intel manager ID is automatically included in the background manager-refresh set.
