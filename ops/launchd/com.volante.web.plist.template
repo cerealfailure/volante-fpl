@@ -3,31 +3,29 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.thenameszinski.volante-web</string>
+  <string>com.volante.web</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/thenameszinski/volante/scripts/volante-web.sh</string>
+    <string>@@VOLANTE_ROOT@@/scripts/volante-web.sh</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/thenameszinski/volante</string>
+  <string>@@VOLANTE_ROOT@@</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/thenameszinski/Library/Logs/volante-web.log</string>
+  <string>@@HOME@@/Library/Logs/volante-web.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/thenameszinski/Library/Logs/volante-web.log</string>
+  <string>@@HOME@@/Library/Logs/volante-web.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>/Users/thenameszinski</string>
+    <string>@@HOME@@</string>
     <key>VOLANTE_WEB_HOST</key>
     <string>0.0.0.0</string>
     <key>VOLANTE_WEB_PORT</key>
     <string>5555</string>
-    <key>VOLANTE_NPM_BIN</key>
-    <string>/Users/thenameszinski/.nvm/versions/node/v24.13.1/bin/npm</string>
   </dict>
 </dict>
 </plist>

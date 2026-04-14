@@ -2,10 +2,11 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-NPM_BIN="${VOLANTE_NPM_BIN:-$HOME/.nvm/versions/node/v24.13.1/bin/npm}"
+NPM_BIN="${VOLANTE_NPM_BIN:-$(command -v npm)}"
 
-if [[ ! -x "$NPM_BIN" ]]; then
-  NPM_BIN="$(command -v npm)"
+if [[ -z "$NPM_BIN" || ! -x "$NPM_BIN" ]]; then
+  echo "npm not found. Install Node.js or set VOLANTE_NPM_BIN to the npm path." >&2
+  exit 1
 fi
 
 export PATH="$(dirname "$NPM_BIN"):/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
