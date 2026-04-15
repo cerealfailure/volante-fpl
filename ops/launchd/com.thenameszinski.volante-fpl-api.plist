@@ -3,29 +3,29 @@
 <plist version="1.0">
 <dict>
   <key>Label</key>
-  <string>com.thenameszinski.volante-api</string>
+  <string>com.thenameszinski.volante-fpl-api</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/Users/thenameszinski/volante/scripts/volante-api.sh</string>
+    <string>__ROOT_DIR__/scripts/volante-api.sh</string>
   </array>
   <key>WorkingDirectory</key>
-  <string>/Users/thenameszinski/volante</string>
+  <string>__ROOT_DIR__</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/thenameszinski/Library/Logs/volante-api.log</string>
+  <string>__HOME__/Library/Logs/volante-fpl-api.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/thenameszinski/Library/Logs/volante-api.log</string>
+  <string>__HOME__/Library/Logs/volante-fpl-api.log</string>
   <key>EnvironmentVariables</key>
   <dict>
     <key>HOME</key>
-    <string>/Users/thenameszinski</string>
+    <string>__HOME__</string>
     <key>VOLANTE_API_HOST</key>
     <string>0.0.0.0</string>
     <key>VOLANTE_API_PORT</key>
-    <string>8555</string>
+    <string>8556</string>
     <key>VOLANTE_ALLOW_ORIGIN_REGEX</key>
     <string>^https?://[^/]+(:[0-9]+)?$</string>
   </dict>

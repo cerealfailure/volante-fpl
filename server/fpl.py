@@ -30,8 +30,10 @@ FplNotFound = fpl_client.FplNotFound
 FplBadResponse = fpl_client.FplBadResponse
 FplUpstreamUnavailable = fpl_client.FplUpstreamUnavailable
 FplRateLimited = fpl_client.FplRateLimited
+FplAuthRequired = fpl_client.FplAuthRequired
 
 _session = fpl_client._session
+_authed_session = fpl_client._authed_session
 fetch_bootstrap = fpl_client.fetch_bootstrap
 fetch_fixtures = fpl_client.fetch_fixtures
 fetch_player_history = fpl_client.fetch_player_history
@@ -41,6 +43,8 @@ fetch_manager_history = fpl_client.fetch_manager_history
 fetch_league_standings = fpl_client.fetch_league_standings
 fetch_manager_transfers = fpl_client.fetch_manager_transfers
 fetch_live_gameweek = fpl_client.fetch_live_gameweek
+fetch_my_team = fpl_client.fetch_my_team
+fetch_me = fpl_client.fetch_me
 
 
 def manager_sync_key(manager_id: int) -> str:
@@ -103,14 +107,22 @@ async def _persist_manager_snapshot(
     return classic_leagues
 
 
-def _compute_free_transfers(history_current: list[dict]) -> int:
+def _compute_free_transfers(history_current: list[dict], chips: list[dict] | None = None) -> int:
     """
     Derive remaining free transfers going into the next deadline.
+
+    Wildcard and Free Hit reset the FT carry: the GW *after* the chip starts
+    from 0 (which becomes 1 once the +1 accrues on deadline). Without this
+    the count runs ahead by the number of chips used.
     """
+    chip_gw = {c.get("event"): c.get("name") for c in (chips or [])}
     ft = 0
     for row in sorted(history_current or [], key=lambda r: r.get("event") or 0):
+        ev = row.get("event") or 0
         ft = min(5, ft + 1)
         ft = max(0, ft - (row.get("event_transfers") or 0))
+        if chip_gw.get(ev) in ("wildcard", "freehit"):
+            ft = 0
     return min(5, ft + 1)
 
 
@@ -309,7 +321,10 @@ async def sync_manager(manager_id: int, include_histories: bool = True, include_
             free_transfers = None
             try:
                 history = await fetch_manager_history(session, manager_id)
-                free_transfers = _compute_free_transfers(history.get("current") or [])
+                free_transfers = _compute_free_transfers(
+                    history.get("current") or [],
+                    history.get("chips") or [],
+                )
             except FplError:
                 pass
 

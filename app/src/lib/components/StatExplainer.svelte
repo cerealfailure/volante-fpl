@@ -87,6 +87,19 @@
       open();
     }
   }
+
+  // Portal: a sibling .reveal-animated ancestor creates a stacking context
+  // (even with fill:both, Chrome keeps a compositing layer) that traps the
+  // fixed tooltip behind later page sections. Re-parent to <body> so
+  // z-index:9500 applies in the root stacking context.
+  function portal(node: HTMLElement) {
+    document.body.appendChild(node);
+    return {
+      destroy() {
+        if (node.parentNode) node.parentNode.removeChild(node);
+      }
+    };
+  }
 </script>
 
 {#if entry}
@@ -111,6 +124,7 @@
       class:flip-down={!tipFlipUp}
       style="left: {tipX}px; top: {tipY}px;"
       role="tooltip"
+      use:portal
     >
       <strong>{entry.short}</strong>
       <p>{entry.long}</p>

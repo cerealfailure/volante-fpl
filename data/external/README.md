@@ -46,7 +46,7 @@ Accepted aliases:
 ## Protected HTTP examples
 
 ```bash
-curl -X POST http://127.0.0.1:8555/api/intel/import-csv \
+curl -X POST http://127.0.0.1:8556/api/intel/import-csv \
   -H 'Content-Type: application/json' \
   -H "X-Volante-Token: $VOLANTE_INTEL_TOKEN" \
   -d '{
@@ -58,6 +58,6 @@ curl -X POST http://127.0.0.1:8555/api/intel/import-csv \
 ```
 
 ```bash
-curl -X POST "http://127.0.0.1:8555/api/intel/123456/run?horizon=5" \
+curl -X POST "http://127.0.0.1:8556/api/intel/123456/run?horizon=5" \
   -H "X-Volante-Token: $VOLANTE_INTEL_TOKEN"
 ```

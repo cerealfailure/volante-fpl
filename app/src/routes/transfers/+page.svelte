@@ -17,6 +17,9 @@
     simulateTransfer,
     simulateTransferPlan,
     getPlayers,
+    getLiveSquad,
+    type LiveSquad,
+    type LiveSquadReason,
   } from '$lib/api';
   import { managerId } from '$lib/session';
   import { goto } from '$app/navigation';
@@ -67,6 +70,13 @@
   let freeTransfersTouched = $state(false);
   let refreshing = $state(false);
 
+  // Live FPL session state (cookie-paste, read-only).
+  //   liveSquad == null + liveReason == null → not attempted yet
+  //   liveSquad != null                      → live data available
+  //   liveReason != null                     → attempted and fell back
+  let liveSquad = $state<LiveSquad | null>(null);
+  let liveReason = $state<LiveSquadReason | null>(null);
+
   // Proactive whole-squad suggestions
   let suggestions: any[] = $state([]);
   let suggestionsLoading = $state(false);
@@ -116,11 +126,29 @@
     if (!$managerId) return;
     loadXray(false);
     loadSuggestions();
+    loadLive();
     getManagerTransfers($managerId, false)
       .then(d => history = d.transfers ?? [])
       .catch(() => {})
       .finally(() => historyLoading = false);
   });
+
+  async function loadLive() {
+    if (!$managerId) return;
+    try {
+      liveSquad = await getLiveSquad($managerId);
+      liveReason = null;
+      // If live reports FT remaining, use it unless user has manually
+      // overridden below. freeTransfersTouched guards manual edits.
+      const rem = liveSquad?.transfers?.remaining;
+      if (typeof rem === 'number' && !freeTransfersTouched) freeTransfers = rem;
+    } catch (e: any) {
+      liveSquad = null;
+      const r = e?.detail?.reason as LiveSquadReason | undefined;
+      liveReason = r ?? null;
+      // Silently fall back to public data — do not surface as an error.
+    }
+  }
   $effect(() => {
     if (!$managerId || !showHistory || transferAnalysis || transferAnalysisLoading) return;
     transferAnalysisLoading = true;
@@ -176,7 +204,14 @@
       .map(id => allPlayers.find((p: any) => p.id === id))
       .filter(Boolean)
   );
-  let bank = $derived(xray?.manager?.bank ?? 0);
+  // Prefer live bank (tenths of £m → £m) when cookie-connected.
+  let bank = $derived(
+    (liveSquad?.transfers?.bank != null)
+      ? (liveSquad.transfers.bank / 10)
+      : (xray?.manager?.bank ?? 0)
+  );
+  let liveFreeTransfers = $derived(liveSquad?.transfers?.remaining ?? null);
+  let freshness: 'live' | 'lastgw' = $derived(liveSquad ? 'live' : 'lastgw');
   // Combined spend budget = bank + sum of prices of everyone we're dropping
   let combinedBudget = $derived(
     bank + dropPlayers.reduce((s: number, p: any) => s + (p?.price ?? 0), 0)
@@ -537,7 +572,10 @@
       <div class="bank-card">
         <Icon.Coin size={16} />
         <div>
-          <span class="stat-label">Combined budget</span>
+          <span class="stat-label">
+            Combined budget
+            <span class="freshness-badge freshness-{freshness}">{freshness === 'live' ? 'LIVE' : 'LAST GW'}</span>
+          </span>
           <span class="bank-val mono">£{enginePlanBudget.toFixed(1)}m</span>
           <span class="dim2 small">£{bank.toFixed(1)}m bank + {nTransfers} sell price{nTransfers === 1 ? '' : 's'}</span>
         </div>
@@ -545,10 +583,15 @@
       <div class="ft-card">
         <Icon.Swap size={14} />
         <div>
-          <span class="stat-label">Free transfers</span>
-          <span class="bank-val mono">{xray?.manager?.free_transfers ?? '—'}</span>
+          <span class="stat-label">
+            Free transfers
+            <span class="freshness-badge freshness-{freshness}">{freshness === 'live' ? 'LIVE' : 'LAST GW'}</span>
+          </span>
+          <span class="bank-val mono">{liveFreeTransfers ?? xray?.manager?.free_transfers ?? '—'}</span>
           <span class="dim2 small">
-            {#if xray?.manager?.event_transfers != null}
+            {#if liveSquad && liveSquad.transfers.made != null && liveSquad.transfers.limit != null}
+              {liveSquad.transfers.made} of {liveSquad.transfers.limit} used
+            {:else if xray?.manager?.event_transfers != null}
               {xray.manager.event_transfers} made GW{xray.event}
             {:else}
               from FPL
@@ -556,6 +599,12 @@
           </span>
         </div>
       </div>
+      {#if liveReason === 'expired' || liveReason === 'no_cookie'}
+        <a class="live-hint" href="/settings" title="Connect FPL live session">
+          <Icon.Whistle size={12} />
+          {liveReason === 'expired' ? 'FPL cookie expired — reconnect' : 'Connect live FPL for in-progress transfer count'}
+        </a>
+      {/if}
       <button class="btn-ghost refresh-btn" onclick={refreshFromFpl} disabled={refreshing} title="Pull latest squad and transfer data from FPL">
         <Icon.Stopwatch size={12} />
         {refreshing ? 'Syncing…' : 'Refresh from FPL'}
@@ -1150,6 +1199,38 @@
     flex-direction: column;
     gap: 0.15rem;
   }
+  .freshness-badge {
+    display: inline-block;
+    margin-left: 0.4rem;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 0.58rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    vertical-align: middle;
+  }
+  .freshness-live {
+    background: var(--accent-soft);
+    color: var(--accent-text);
+    border: 1px solid rgba(0, 255, 156, 0.25);
+  }
+  .freshness-lastgw {
+    background: rgba(255,255,255,0.04);
+    color: var(--text-muted);
+    border: 1px solid var(--line);
+  }
+  .live-hint {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.72rem;
+    color: var(--text-muted);
+    padding: 0.3rem 0.6rem;
+    border: 1px dashed var(--line);
+    border-radius: var(--radius-sm);
+    text-decoration: none;
+  }
+  .live-hint:hover { color: var(--accent); border-color: var(--accent-soft); }
   .refresh-btn {
     align-self: center;
     white-space: nowrap;

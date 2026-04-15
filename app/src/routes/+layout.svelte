@@ -102,6 +102,13 @@
             Portfolio analytics for FPL managers
           </span>
         {/if}
+        <a href="/settings"
+           class="settings-link"
+           class:active={$page.url.pathname.startsWith('/settings')}
+           title="FPL session & settings"
+           aria-label="Settings">
+          <Icon.Whistle size={14} />
+        </a>
         <ThemeSwitcher />
       </div>
     </div>
@@ -240,6 +247,19 @@
                 opacity var(--duration-fast) var(--ease);
   }
   .nav-link:hover { color: var(--text); }
+  .settings-link {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    color: var(--text-muted);
+    border: 1px solid transparent;
+    transition: color 120ms, border-color 120ms, background 120ms;
+  }
+  .settings-link:hover { color: var(--accent); border-color: var(--accent-soft); }
+  .settings-link.active { color: var(--accent); border-color: var(--accent-soft); background: var(--accent-soft); }
   .header-nav:has(.nav-link:hover) .nav-link:not(:hover) {
     opacity: 0.55;
   }

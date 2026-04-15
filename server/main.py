@@ -1,5 +1,5 @@
 """
-Volante API server — FastAPI on port 8555.
+Volante API server — FastAPI, default dev port 8556.
 
 Endpoints:
   POST /api/sync                 — trigger full FPL data sync
@@ -26,6 +26,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import db
 import fpl
+import fpl_auth
 import analysis
 import fixture_exposure
 import intel as intel_engine
@@ -137,6 +138,12 @@ app.add_middleware(
 
 class SyncManagerRequest(BaseModel):
     manager_id: int
+
+
+class FplCookieRequest(BaseModel):
+    # Raw pasted cookie text: either a bare pl_profile value, or a full
+    # "pl_profile=...; csrftoken=..." header. Parsed server-side.
+    raw: str
 
 class TransferSimRequest(BaseModel):
     player_out: int
@@ -679,6 +686,194 @@ async def league_standings(league_id: int, page: int = Query(default=1, ge=1), r
         raise
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ── FPL session cookie + live team (authenticated pass-through) ─────
+
+_LIVE_CACHE: dict[int, tuple[float, dict]] = {}
+# 30s matches FPL's own poll cadence and keeps us well under the 1 req/s
+# informal rate ceiling (see docs/research/fpl-auth-2026.md).
+_LIVE_TTL_SECONDS = 30.0
+
+
+def _require_loopback(request: Request):
+    """Fail cookie-writing endpoints unless called from 127.0.0.1/::1."""
+    host = (request.client.host if request.client else "") or ""
+    if host not in {"127.0.0.1", "::1", "localhost"}:
+        raise HTTPException(403, "FPL cookie endpoints are loopback-only")
+
+
+def _live_cache_get(manager_id: int) -> dict | None:
+    import time
+    hit = _LIVE_CACHE.get(manager_id)
+    if not hit:
+        return None
+    fetched_at, payload = hit
+    if time.monotonic() - fetched_at > _LIVE_TTL_SECONDS:
+        _LIVE_CACHE.pop(manager_id, None)
+        return None
+    return payload
+
+
+def _live_cache_set(manager_id: int, payload: dict):
+    import time
+    _LIVE_CACHE[manager_id] = (time.monotonic(), payload)
+
+
+def _shape_my_team(manager_id: int, raw: dict) -> dict:
+    """
+    Extract only the fields the UI needs. Anything opaque to us stays out of
+    the response so we never echo unknown account data back.
+    """
+    transfers_node = raw.get("transfers") or {}
+    chips_node = raw.get("chips") or []
+    picks = raw.get("picks") or []
+    # bank / value are returned in tenths of £m (bank=35 → £3.5m). Kept as-is
+    # because the rest of Volante expects tenths — see manager_info schema.
+    t_limit = transfers_node.get("limit")
+    t_made = transfers_node.get("made")
+    t_remaining = (
+        max(0, t_limit - t_made)
+        if isinstance(t_limit, int) and isinstance(t_made, int)
+        else None
+    )
+    return {
+        "manager_id": manager_id,
+        "event": (raw.get("entry_history") or {}).get("event"),
+        "picks": [
+            {
+                "element": p.get("element"),
+                "position": p.get("position"),
+                "multiplier": p.get("multiplier"),
+                "is_captain": p.get("is_captain"),
+                "is_vice_captain": p.get("is_vice_captain"),
+                "selling_price": p.get("selling_price"),
+                "purchase_price": p.get("purchase_price"),
+            }
+            for p in picks
+        ],
+        "transfers": {
+            "made": t_made,
+            "limit": t_limit,
+            "remaining": t_remaining,
+            "bank": transfers_node.get("bank"),
+            "value": transfers_node.get("value"),
+            "cost": transfers_node.get("cost"),
+            # "unlimited" signals an active wildcard/free-hit window —
+            # the only reliable pending-chip flag FPL exposes via my-team.
+            "status": transfers_node.get("status"),
+        },
+        "chips_staged": [
+            c.get("name") for c in chips_node
+            if isinstance(c, dict) and c.get("status_for_entry") in {"active", "selected"}
+        ],
+    }
+
+
+async def _validate_cookie_for_account(jar: dict[str, str]) -> int:
+    """
+    Ping /me/ to confirm the cookie is valid, and return the owning entry id.
+    Raises FplAuthRequired if /me/ doesn't yield a usable entry id — covers
+    both explicit 401/403 and silent "bogus cookie → anonymous JSON" cases
+    DataDome sometimes produces.
+    """
+    async with fpl._authed_session(jar) as session:
+        me = await fpl.fetch_me(session)
+    player = me.get("player") or {}
+    entry = player.get("entry")
+    if not isinstance(entry, int):
+        # Older shape: me["entry"] directly.
+        entry = me.get("entry")
+    if not isinstance(entry, int):
+        # Cookie passed HTTP but response doesn't identify a user.
+        # Treat as auth failure so the UI can prompt a re-paste.
+        raise fpl.FplAuthRequired("cookie accepted by FPL but /me/ returned no entry id")
+    return entry
+
+
+@app.post("/api/settings/fpl-cookie")
+async def settings_set_fpl_cookie(req: FplCookieRequest, request: Request):
+    """
+    Paste FPL cookie, validate with a live /me/ ping, and store locally.
+    Loopback only. Cookie value is never returned in the response.
+    """
+    _require_loopback(request)
+    parsed = fpl_auth.parse_cookie_input(req.raw)
+    if fpl_auth.REQUIRED_FOR_READS not in parsed:
+        raise HTTPException(400, f"Cookie input must include {fpl_auth.REQUIRED_FOR_READS}")
+    try:
+        account_id = await _validate_cookie_for_account(parsed)
+    except fpl.FplAuthRequired:
+        raise HTTPException(401, "Cookie rejected by FPL — expired or invalid")
+    except fpl.FplError as e:
+        raise HTTPException(503, f"Could not validate with FPL: {e}")
+    fpl_auth.save_cookies(parsed, account_id=account_id)
+    fpl_auth.audit("/me/", account_id, 200)
+    return fpl_auth.get_status()
+
+
+@app.get("/api/settings/fpl-status")
+async def settings_fpl_status():
+    return fpl_auth.get_status()
+
+
+@app.delete("/api/settings/fpl-cookie")
+async def settings_clear_fpl_cookie(request: Request):
+    _require_loopback(request)
+    fpl_auth.clear_cookies()
+    _LIVE_CACHE.clear()
+    return {"ok": True}
+
+
+@app.get("/api/live/{manager_id}/squad")
+async def live_squad(manager_id: int):
+    """
+    Live (pre-deadline) squad for the given manager. Returns 428 with a
+    typed reason if cookie is missing, expired, or for a different account.
+    """
+    cached = _live_cache_get(manager_id)
+    if cached:
+        return cached
+
+    jar = fpl_auth.get_cookie_jar()
+    if not jar:
+        raise HTTPException(428, detail={
+            "reason": "no_cookie",
+            "message": "Paste your FPL cookie in Settings to see live data.",
+        })
+
+    stored = fpl_auth.load_cookies() or {}
+    stored_account = stored.get("account_id")
+    if isinstance(stored_account, int) and stored_account != manager_id:
+        raise HTTPException(428, detail={
+            "reason": "account_mismatch",
+            "message": (
+                f"Stored cookie belongs to manager #{stored_account}, not #{manager_id}."
+            ),
+            "stored_account_id": stored_account,
+        })
+
+    try:
+        async with fpl._authed_session(jar) as session:
+            raw = await fpl.fetch_my_team(session, manager_id)
+    except fpl.FplAuthRequired:
+        fpl_auth.audit(f"/my-team/{manager_id}/", manager_id, 401)
+        raise HTTPException(428, detail={
+            "reason": "expired",
+            "message": "Your FPL cookie has expired. Re-paste it in Settings.",
+        })
+    except fpl.FplNotFound:
+        fpl_auth.audit(f"/my-team/{manager_id}/", manager_id, 404)
+        raise HTTPException(404, f"Manager #{manager_id} not found on FPL")
+    except fpl.FplError as e:
+        fpl_auth.audit(f"/my-team/{manager_id}/", manager_id, "error")
+        raise _http_from_fpl_error(e)
+
+    fpl_auth.audit(f"/my-team/{manager_id}/", manager_id, 200)
+    fpl_auth.mark_validated(manager_id)
+    result = _shape_my_team(manager_id, raw)
+    _live_cache_set(manager_id, result)
+    return result
 
 
 @app.get("/api/manager/{manager_id}/transfers")
@@ -1280,4 +1475,4 @@ async def squad_fixture_exposure(manager_id: int, event: int | None = None):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("main:app", host="127.0.0.1", port=8555, reload=True)
+    uvicorn.run("main:app", host="127.0.0.1", port=8556, reload=True)

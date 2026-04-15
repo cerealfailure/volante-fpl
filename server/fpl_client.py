@@ -43,12 +43,42 @@ class FplRateLimited(FplUpstreamUnavailable):
     """The FPL API rate-limited the request."""
 
 
+class FplAuthRequired(FplError):
+    """Authenticated endpoint hit with missing/expired/invalid cookie (401/403)."""
+
+
+# Browser-like UA for authed calls — FPL's edge is more tolerant than a bot UA,
+# and my-team/ has been observed to 403 a bare "volante/0.3" UA in the wild.
+_BROWSER_UA = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
+
+
 def _session() -> aiohttp.ClientSession:
     connector = aiohttp.TCPConnector(ssl=_ssl_ctx)
     headers = {
         "Accept": "application/json",
         "User-Agent": USER_AGENT,
     }
+    return aiohttp.ClientSession(connector=connector, headers=headers, timeout=REQUEST_TIMEOUT)
+
+
+def _authed_session(cookies: dict[str, str]) -> aiohttp.ClientSession:
+    """
+    Session that carries the user's FPL cookies. Attach ONLY to fantasy.premierleague.com
+    authenticated paths (my-team/, me/). Do not reuse for public endpoints.
+    """
+    cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
+    headers = {
+        "Accept": "application/json",
+        "Accept-Language": "en-GB,en;q=0.9",
+        "User-Agent": _BROWSER_UA,
+        "Referer": "https://fantasy.premierleague.com/",
+        "Origin": "https://fantasy.premierleague.com",
+        "Cookie": cookie_header,
+    }
+    connector = aiohttp.TCPConnector(ssl=_ssl_ctx)
     return aiohttp.ClientSession(connector=connector, headers=headers, timeout=REQUEST_TIMEOUT)
 
 
@@ -65,6 +95,9 @@ async def _request_json(session: aiohttp.ClientSession, path: str) -> dict | lis
             async with session.get(url) as resp:
                 if resp.status == 404:
                     raise FplNotFound(f"FPL resource not found: {path}")
+
+                if resp.status in (401, 403):
+                    raise FplAuthRequired(f"FPL auth required for {path} (status {resp.status})")
 
                 if resp.status == 429:
                     retry_after = resp.headers.get("Retry-After")
@@ -92,6 +125,8 @@ async def _request_json(session: aiohttp.ClientSession, path: str) -> dict | lis
         except FplNotFound:
             raise
         except FplBadResponse:
+            raise
+        except FplAuthRequired:
             raise
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             last_error = FplUpstreamUnavailable(f"FPL upstream unavailable for {path}")
@@ -166,4 +201,25 @@ async def fetch_live_gameweek(session: aiohttp.ClientSession, event_id: int) -> 
     data = await _request_json(session, f"event/{event_id}/live/")
     if not isinstance(data, dict):
         raise FplBadResponse(f"event/{event_id}/live returned a non-object payload")
+    return data
+
+
+# ── Authenticated endpoints (require a session built by _authed_session) ────
+
+async def fetch_my_team(session: aiohttp.ClientSession, manager_id: int) -> dict[str, Any]:
+    """
+    Live (pre-deadline) team state: picks, chips staged, transfers remaining,
+    live bank and team value. Requires a valid pl_profile cookie.
+    """
+    data = await _request_json(session, f"my-team/{manager_id}/")
+    if not isinstance(data, dict):
+        raise FplBadResponse(f"my-team/{manager_id} returned a non-object payload")
+    return data
+
+
+async def fetch_me(session: aiohttp.ClientSession) -> dict[str, Any]:
+    """Validate a cookie: /me/ returns the owning account's player.entry.id."""
+    data = await _request_json(session, "me/")
+    if not isinstance(data, dict):
+        raise FplBadResponse("me/ returned a non-object payload")
     return data

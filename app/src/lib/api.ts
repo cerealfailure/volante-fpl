@@ -20,7 +20,15 @@ async function request(path: string, opts: RequestInit = {}) {
   });
   if (!res.ok) {
     const body = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(body.detail || `HTTP ${res.status}`);
+    // Preserve the status + parsed detail on the Error so callers can branch
+    // on things like the 428 {reason,message} contract from /api/live/*.
+    const msg = typeof body.detail === 'string'
+      ? body.detail
+      : (body?.detail?.message || `HTTP ${res.status}`);
+    const err = new Error(msg) as Error & { status?: number; detail?: unknown };
+    err.status = res.status;
+    err.detail = body?.detail ?? body;
+    throw err;
   }
   return res.json();
 }
@@ -89,3 +97,45 @@ export const getLiveData = (mgr: number) => request(`/api/live/${mgr}`);
 export const getGameweekStatus = () => request('/api/gameweek-status');
 export const getPredictionAccuracy = (mgr: number, weeks = 6) =>
   request(withQuery(`/api/live/${mgr}/accuracy`, { weeks }));
+
+// ── FPL Session (cookie-paste live state) ───────────────────────
+export type FplSessionStatus = {
+  connected: boolean;
+  has_csrf: boolean;
+  account_id: number | null;
+  stored_at: string | null;
+  last_validated_at: string | null;
+};
+
+export type LiveSquad = {
+  manager_id: number;
+  event: number | null;
+  picks: Array<{
+    element: number; position: number; multiplier: number;
+    is_captain: boolean; is_vice_captain: boolean;
+    selling_price: number; purchase_price: number;
+  }>;
+  transfers: {
+    made: number | null; limit: number | null; remaining: number | null;
+    bank: number | null; value: number | null; cost: number | null;
+    status: string | null;
+  };
+  chips_staged: string[];
+};
+
+export type LiveSquadReason = 'no_cookie' | 'expired' | 'account_mismatch';
+
+export const getFplStatus = (): Promise<FplSessionStatus> =>
+  request('/api/settings/fpl-status');
+
+export const setFplCookie = (raw: string): Promise<FplSessionStatus> =>
+  request('/api/settings/fpl-cookie', {
+    method: 'POST',
+    body: JSON.stringify({ raw }),
+  });
+
+export const clearFplCookie = (): Promise<{ ok: true }> =>
+  request('/api/settings/fpl-cookie', { method: 'DELETE' });
+
+export const getLiveSquad = (mgr: number): Promise<LiveSquad> =>
+  request(`/api/live/${mgr}/squad`);

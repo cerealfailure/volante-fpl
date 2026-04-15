@@ -45,10 +45,33 @@ cp .env.example .env
 
 Default local URLs:
 
-- frontend: `http://127.0.0.1:5555`
-- API: `http://127.0.0.1:8555`
+- frontend: `http://127.0.0.1:5556`
+- API: `http://127.0.0.1:8556`
 
 The default `.env.example` keeps the app in `fpl_only` mode and binds locally, which is the recommended GitHub setup.
+The split is intentional: Volante FPL stays on `5556/8556` so it can coexist with the betting app on `5555/8555`.
+
+## macOS launchd
+
+If you want FPL to stay up after Terminal closes:
+
+```bash
+./scripts/install-volante-launchd.sh
+```
+
+Useful commands:
+
+```bash
+./scripts/status-volante-launchd.sh
+./scripts/uninstall-volante-launchd.sh
+```
+
+The launch agents now use their own labels and logs, so they do not collide with the betting repo:
+
+- `com.thenameszinski.volante-fpl-web`
+- `com.thenameszinski.volante-fpl-api`
+- `~/Library/Logs/volante-fpl-web.log`
+- `~/Library/Logs/volante-fpl-api.log`
 
 ## Modes
 
@@ -88,7 +111,7 @@ Protection model:
 Check the active mode:
 
 ```bash
-curl http://127.0.0.1:8555/api/status
+curl http://127.0.0.1:8556/api/status
 ```
 
 The response includes a `mode` block.
@@ -99,9 +122,9 @@ Main variables:
 
 - `VOLANTE_MODE=fpl_only|overall`
 - `VOLANTE_API_HOST=127.0.0.1`
-- `VOLANTE_API_PORT=8555`
+- `VOLANTE_API_PORT=8556`
 - `VOLANTE_WEB_HOST=127.0.0.1`
-- `VOLANTE_WEB_PORT=5555`
+- `VOLANTE_WEB_PORT=5556`
 - `VOLANTE_ALLOW_ORIGIN_REGEX=^https?://[^/]+(?::\\d+)?$`
 - `VOLANTE_INTEL_TOKEN=...` optional, recommended for remote internal access
 - `VOLANTE_INTEL_MANAGER_ID=123456` optional background loop target
@@ -132,7 +155,7 @@ export VOLANTE_WEB_HOST=0.0.0.0
 
 Then share:
 
-- `http://<your-host>:5555`
+- `http://<your-host>:5556`
 
 Recommended for friend sharing:
 
@@ -205,14 +228,14 @@ Only use these if you need HTTP access to the private analyzer.
 Run an intel pass:
 
 ```bash
-curl -X POST "http://127.0.0.1:8555/api/intel/123456/run?horizon=5" \
+curl -X POST "http://127.0.0.1:8556/api/intel/123456/run?horizon=5" \
   -H "X-Volante-Token: $VOLANTE_INTEL_TOKEN"
 ```
 
 Import a CSV snapshot:
 
 ```bash
-curl -X POST http://127.0.0.1:8555/api/intel/import-csv \
+curl -X POST http://127.0.0.1:8556/api/intel/import-csv \
   -H 'Content-Type: application/json' \
   -H "X-Volante-Token: $VOLANTE_INTEL_TOKEN" \
   -d '{
@@ -251,7 +274,7 @@ The core poll cadence tightens automatically near the next open fixture:
 Check health with:
 
 ```bash
-curl http://127.0.0.1:8555/api/status
+curl http://127.0.0.1:8556/api/status
 ```
 
 The response now includes:
