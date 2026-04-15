@@ -246,6 +246,60 @@ async def sync_player_histories(player_ids: list[int]) -> dict:
         await conn.close()
 
 
+async def _enrich_transfer_eps(conn, transfers: list[dict]) -> list[dict]:
+    """
+    Annotate each transfer with forecast EP (from players.ep_next at sync time)
+    and realised pts (from live_gw_cache for the row's event, when present).
+
+    Forecast is approximate for old rows since players.ep_next is FPL's current
+    forward-looking number — but it's reasonable as a directional signal, and
+    new transfers (synced soon after the user makes them) capture FPL's EP at
+    that moment. Realised is exact whenever we've cached the GW.
+    """
+    if not transfers:
+        return transfers
+    player_ids = {t.get("element_in") for t in transfers} | {t.get("element_out") for t in transfers}
+    player_ids.discard(None)
+    if not player_ids:
+        return transfers
+    rows = await conn.execute_fetchall(
+        f"SELECT id, ep_next FROM players WHERE id IN ({','.join('?' * len(player_ids))})",
+        list(player_ids),
+    )
+    ep_by_player = {r["id"]: r["ep_next"] for r in rows}
+
+    by_event: dict[int, set[int]] = {}
+    for t in transfers:
+        ev = t.get("event")
+        if not ev:
+            continue
+        s = by_event.setdefault(ev, set())
+        if t.get("element_in"):
+            s.add(t["element_in"])
+        if t.get("element_out"):
+            s.add(t["element_out"])
+
+    realised_by_event: dict[int, dict[int, dict]] = {}
+    for ev, ids in by_event.items():
+        realised_by_event[ev] = await db.get_live_gw(conn, ev, list(ids))
+
+    enriched = []
+    for t in transfers:
+        ep_in = ep_by_player.get(t.get("element_in"))
+        ep_out = ep_by_player.get(t.get("element_out"))
+        ep_delta = (ep_in - ep_out) if (ep_in is not None and ep_out is not None) else None
+        ev = t.get("event")
+        live_in = realised_by_event.get(ev, {}).get(t.get("element_in"), {}).get("total_points") if ev else None
+        live_out = realised_by_event.get(ev, {}).get(t.get("element_out"), {}).get("total_points") if ev else None
+        realised_delta = (live_in - live_out) if (live_in is not None and live_out is not None) else None
+        enriched.append({
+            **t,
+            "ep_in": ep_in, "ep_out": ep_out, "ep_delta": ep_delta,
+            "realised_in": live_in, "realised_out": live_out, "realised_delta": realised_delta,
+        })
+    return enriched
+
+
 async def sync_manager_leagues(manager_id: int) -> dict:
     """Fetch and cache a manager's league memberships."""
     print(f"Syncing manager leagues {manager_id}...")
@@ -267,6 +321,7 @@ async def sync_manager_transfers(manager_id: int) -> dict:
     try:
         async with _session() as session:
             transfers = await fetch_manager_transfers(session, manager_id)
+        transfers = await _enrich_transfer_eps(conn, transfers)
         await db.replace_manager_transfers(conn, manager_id, transfers)
         meta = {"count": len(transfers)}
         await db.set_sync(conn, manager_transfers_sync_key(manager_id), meta)
@@ -357,6 +412,7 @@ async def sync_manager(manager_id: int, include_histories: bool = True, include_
             transfers = []
             if include_transfers:
                 transfers = await fetch_manager_transfers(session, manager_id)
+                transfers = await _enrich_transfer_eps(conn, transfers)
                 await db.replace_manager_transfers(conn, manager_id, transfers)
                 await db.set_sync(conn, manager_transfers_sync_key(manager_id), {
                     "count": len(transfers),

@@ -941,6 +941,15 @@
                           </span>
                           <span class="dim2">·</span>
                           <span class="mono">{c.form?.toFixed(1)} form</span>
+                          {#if c.breakdown?.risk_penalty != null && Math.abs(c.breakdown.risk_penalty) >= 0.05}
+                            <span class="dim2">·</span>
+                            <span
+                              class="mono {c.breakdown.risk_penalty > 0 ? 'negative' : 'positive'}"
+                              title="Concentration penalty in EP units. Positive = swap raises portfolio variance (worse diversification). After-penalty ΔEP: {c.breakdown.effective_ep_delta?.toFixed(2)}"
+                            >
+                              {c.breakdown.risk_penalty > 0 ? '−' : '+'}{Math.abs(c.breakdown.risk_penalty).toFixed(1)} concn
+                            </span>
+                          {/if}
                         </div>
                         {#if c.fixture_strip?.length}
                           <div class="cand-fixtures">
@@ -1117,6 +1126,8 @@
                   <th class="r">Sell</th>
                   <th>In</th>
                   <th class="r">Buy</th>
+                  <th class="r" title="Forecast EP delta at the moment we synced this transfer (in − out)">ΔEP fcst</th>
+                  <th class="r" title="Realised points delta in the gameweek this transfer applied to (in − out)">ΔPts real</th>
                   <th class="r">Alpha/GW</th>
                   <th>Matrix</th>
                 </tr>
@@ -1131,6 +1142,12 @@
                     <td class="r mono">£{t.out_cost?.toFixed(1) ?? '—'}</td>
                     <td>{t.in_name}</td>
                     <td class="r mono">£{t.in_cost?.toFixed(1) ?? '—'}</td>
+                    <td class="r mono {t.ep_delta > 0 ? 'positive' : t.ep_delta < 0 ? 'negative' : ''}">
+                      {t.ep_delta != null ? (t.ep_delta > 0 ? '+' : '') + t.ep_delta.toFixed(1) : '—'}
+                    </td>
+                    <td class="r mono {t.realised_delta > 0 ? 'positive' : t.realised_delta < 0 ? 'negative' : ''}">
+                      {t.realised_delta != null ? (t.realised_delta > 0 ? '+' : '') + t.realised_delta : '—'}
+                    </td>
                     <td class="r mono {scored?.net_per_gw_alpha > 0 ? 'positive' : scored?.net_per_gw_alpha < 0 ? 'negative' : ''}">
                       {alphaPerGwLabel(scored)}
                     </td>

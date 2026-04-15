@@ -441,6 +441,21 @@ async def init_db():
                 await db.execute(f"ALTER TABLE manager_info ADD COLUMN {col} {decl}")
             except Exception:
                 pass
+        # Transfer EP delta columns. Forecast = projected at the moment we
+        # first see the transfer (snapshotted from projections.next_event_ep).
+        # Realised = actual points in the same gameweek the transfer applies to.
+        for col, decl in [
+            ("ep_in", "REAL"),
+            ("ep_out", "REAL"),
+            ("ep_delta", "REAL"),
+            ("realised_in", "INTEGER"),
+            ("realised_out", "INTEGER"),
+            ("realised_delta", "INTEGER"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE manager_transfers ADD COLUMN {col} {decl}")
+            except Exception:
+                pass
         await db.commit()
     finally:
         await db.close()
@@ -713,8 +728,11 @@ async def replace_manager_transfers(db: aiosqlite.Connection, manager_id: int, t
     await db.execute("DELETE FROM manager_transfers WHERE manager_id=?", (manager_id,))
     await db.executemany("""
         INSERT INTO manager_transfers
-        (manager_id, event, time, element_in, element_in_cost, element_out, element_out_cost)
-        VALUES (?,?,?,?,?,?,?)
+        (manager_id, event, time, element_in, element_in_cost,
+         element_out, element_out_cost,
+         ep_in, ep_out, ep_delta,
+         realised_in, realised_out, realised_delta)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
     """, [(
         manager_id,
         row.get("event"),
@@ -723,7 +741,15 @@ async def replace_manager_transfers(db: aiosqlite.Connection, manager_id: int, t
         row.get("element_in_cost"),
         row.get("element_out"),
         row.get("element_out_cost"),
+        row.get("ep_in"),
+        row.get("ep_out"),
+        row.get("ep_delta"),
+        row.get("realised_in"),
+        row.get("realised_out"),
+        row.get("realised_delta"),
     ) for row in transfers])
+
+
 
 
 async def set_sync(db: aiosqlite.Connection, key: str, meta: dict | None = None):
@@ -872,7 +898,9 @@ async def get_manager_transfers(db: aiosqlite.Connection, manager_id: int) -> li
                mt.element_in_cost / 10.0 as in_cost,
                mt.element_out as out_id,
                COALESCE(pout.web_name, '#' || mt.element_out) as out_name,
-               mt.element_out_cost / 10.0 as out_cost
+               mt.element_out_cost / 10.0 as out_cost,
+               mt.ep_in, mt.ep_out, mt.ep_delta,
+               mt.realised_in, mt.realised_out, mt.realised_delta
         FROM manager_transfers mt
         LEFT JOIN players pin ON pin.id = mt.element_in
         LEFT JOIN players pout ON pout.id = mt.element_out
