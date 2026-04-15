@@ -114,6 +114,49 @@ def _build_fixture_strip(
     return strip
 
 
+def _correlation_penalty(
+    candidate_id: int,
+    sell_id: int,
+    risk_context: dict | None,
+) -> tuple[float, dict | None]:
+    """
+    Marginal variance contribution of a swap, in EP units.
+
+    Uses a pre-computed structural covariance matrix indexed by player_id.
+    A positive penalty means the swap raises portfolio variance (worse for
+    diversification); a negative one means the swap reduces variance.
+
+    Returns (penalty_in_ep_units, breakdown) or (0.0, None) if no context.
+    """
+    if not risk_context:
+        return 0.0, None
+    cov = risk_context.get("cov")
+    idx = risk_context.get("idx") or {}
+    current_xv = risk_context.get("current_xv_ids") or []
+    lam = float(risk_context.get("lambda", 0.45))
+    if cov is None or candidate_id not in idx or sell_id not in idx:
+        return 0.0, None
+    if any(pid not in idx for pid in current_xv):
+        return 0.0, None
+    import numpy as np
+    before_idx = [idx[pid] for pid in current_xv]
+    after_xv = [candidate_id if pid == sell_id else pid for pid in current_xv]
+    after_idx = [idx[pid] for pid in after_xv]
+    w = np.ones(len(current_xv))
+    var_before = float(w @ cov[np.ix_(before_idx, before_idx)] @ w)
+    var_after = float(w @ cov[np.ix_(after_idx, after_idx)] @ w)
+    marginal = var_after - var_before
+    # Convert variance change to EP units via signed sqrt: large variance
+    # swings shouldn't dominate; small ones still register a signal.
+    penalty_ep = lam * (np.sign(marginal) * np.sqrt(abs(marginal)))
+    return float(penalty_ep), {
+        "var_before": round(var_before, 2),
+        "var_after": round(var_after, 2),
+        "marginal_var": round(marginal, 2),
+        "risk_penalty_ep": round(float(penalty_ep), 2),
+    }
+
+
 def _score_candidate(
     candidate: dict,
     sell_player: dict,
@@ -122,6 +165,7 @@ def _score_candidate(
     base_team_counts: dict[int, int],
     horizon: int,
     availability_state: dict | None = None,
+    risk_context: dict | None = None,
 ) -> tuple[float, dict]:
     """Composite transfer score with horizon-aware breakdown."""
     pos = _player_position(candidate)
@@ -161,6 +205,16 @@ def _score_candidate(
         - _minutes_factor(sell_player, event, availability_state)
     ) * 4.0
 
+    # Correlation-aware penalty: the swap's marginal contribution to portfolio
+    # variance is converted to EP units and subtracted. Two players whose raw
+    # EPs are equal will now score differently if one increases concentration.
+    risk_penalty, risk_breakdown = _correlation_penalty(
+        candidate.get("id") or candidate.get("player_id"),
+        sell_player.get("player_id") or sell_player.get("id"),
+        risk_context,
+    )
+    effective_ep_delta = ep_delta - risk_penalty
+
     score = (
         projected_gain * 1.45
         + ep_delta * 0.55
@@ -170,6 +224,7 @@ def _score_candidate(
         + diversification * 0.75
         + set_piece_bonus * 0.35
         + minutes_score * 0.45
+        - risk_penalty * 0.85  # concentration drag on the composite score
     )
 
     breakdown = {
@@ -181,7 +236,11 @@ def _score_candidate(
         "diversification": round(diversification, 2),
         "set_pieces": round(set_piece_bonus, 2),
         "minutes_confidence": round(minutes_score, 2),
+        "risk_penalty": round(risk_penalty, 2),
+        "effective_ep_delta": round(effective_ep_delta, 2),
     }
+    if risk_breakdown:
+        breakdown["risk_detail"] = risk_breakdown
     return score, breakdown
 
 
@@ -195,6 +254,7 @@ def _build_candidate_record(
     horizon: int,
     slot_budget: float,
     availability_state: dict | None = None,
+    risk_context: dict | None = None,
 ) -> dict:
     score, breakdown = _score_candidate(
         candidate,
@@ -204,6 +264,7 @@ def _build_candidate_record(
         base_team_counts,
         horizon,
         availability_state,
+        risk_context,
     )
     projection = projections.project_player(candidate, fixtures_by_team, horizon, event, availability_state)
     projected_ep = projection["horizon_ep"]
@@ -976,6 +1037,31 @@ async def recommend_replacements(
         plan_budget = bank + sum(_player_price(player) for player in sell_players)
         recommended_horizon, planning_reason = _recommended_horizon(squad, sell_players, fixtures_by_team)
 
+        # Pre-compute structural covariance over the candidate universe so each
+        # _score_candidate call can do a cheap numpy slice instead of a DB hit.
+        # Universe = current XV ∪ all eligible candidates across slots.
+        starter_ids = [s["player_id"] for s in squad if s["squad_position"] <= 11]
+        candidate_universe = set(starter_ids) | set(removed_player_ids)
+        for sell_player in sell_players:
+            pos = sell_player["pos_type"]
+            for cand in all_players.values():
+                if not _candidate_is_eligible(cand, keep_player_ids, removed_player_ids, base_team_counts, pos):
+                    continue
+                candidate_universe.add(cand["id"])
+        risk_context = None
+        if starter_ids and candidate_universe:
+            try:
+                universe_ids = sorted(candidate_universe)
+                cov_block = await analysis.compute_structural_covariance(universe_ids, database)
+                risk_context = {
+                    "cov": cov_block,
+                    "idx": {pid: i for i, pid in enumerate(universe_ids)},
+                    "current_xv_ids": starter_ids,
+                    "lambda": 0.45,
+                }
+            except Exception:
+                risk_context = None
+
         slot_min_costs = {}
         for sell_player in sell_players:
             pos = sell_player["pos_type"]
@@ -1017,6 +1103,7 @@ async def recommend_replacements(
                     horizon,
                     slot_budget,
                     availability_state,
+                    risk_context,
                 )
                 row["position"] = pos
                 row["xg"] = candidate.get("xg")
