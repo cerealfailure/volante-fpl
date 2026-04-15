@@ -92,6 +92,32 @@ export const getTransferAnalysis = (id: number) => request(`/api/manager/${id}/t
 
 export const getFixtureExposure = (mgr: number) => request(`/api/xray/${mgr}/fixtures`);
 
+export type CaptainCandidate = {
+  player_id: number;
+  web_name: string;
+  team_short: string;
+  squad_position: number;
+  ep_next: number;
+  expected_minutes_next: number;
+  minutes_factor: number;
+  captain_score: number;
+  is_captain: boolean;
+  is_vice_captain: boolean;
+};
+
+export type CaptainSuggestion = {
+  manager_id: number;
+  projection_event: number;
+  current_captain: CaptainCandidate | null;
+  recommended: CaptainCandidate;
+  swing_ep: number;
+  should_switch: boolean;
+  ranking: CaptainCandidate[];
+};
+
+export const getCaptainSuggestion = (mgr: number): Promise<CaptainSuggestion> =>
+  request(`/api/xray/${mgr}/suggest-captain`);
+
 // ── Live Gameweek ───────────────────────────────────────────────
 export const getLiveData = (mgr: number) => request(`/api/live/${mgr}`);
 export const getGameweekStatus = () => request('/api/gameweek-status');

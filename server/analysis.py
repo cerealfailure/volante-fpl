@@ -1369,3 +1369,76 @@ def _default_team_stats():
         "cov_sc": 0.0,
         "cs_rate": 0.3,
     }
+
+
+async def suggest_captain(manager_id: int, event: int | None = None) -> dict:
+    """
+    Rank starters by expected captain value for the upcoming gameweek.
+
+    Score = next_event_ep × minutes_factor − minutes_risk_penalty.
+    The minutes factor down-weights players unlikely to play (injury / rotation).
+    The penalty bites hardest when expected_minutes_next < 60.
+
+    Returns the current armband, the recommended XI captain, and the
+    marginal swing (in EP terms) of switching — captain is doubled, so the
+    swing is 2 × (best_ep − current_ep).
+    """
+    database = await db.get_db()
+    try:
+        if event is None:
+            event = await db.get_current_event(database)
+        if event is None:
+            raise ValueError("No current event found — sync data first")
+        squad = await db.get_manager_squad(database, manager_id, event)
+        if not squad:
+            raise ValueError(f"No squad found for manager {manager_id} GW{event}")
+        starters = [s for s in squad if s["squad_position"] <= 11]
+        if not starters:
+            raise ValueError(f"No starters found for manager {manager_id} GW{event}")
+
+        projection_context = await projections.build_projection_context(database, event, 1)
+        projection_event = projection_context["target_event"]
+        projs = projections.project_players(starters, projection_context, 1)
+
+        ranked = []
+        for s in starters:
+            p = projs.get(s["player_id"], {})
+            ep = float(p.get("next_event_ep") or 0.0)
+            mins = float(p.get("expected_minutes_next") or 0.0)
+            avail = p.get("availability") or {}
+            mins_factor = float(avail.get("minutes_factor") or (mins / 90.0 if mins else 0.0))
+            mins_factor = max(0.0, min(1.0, mins_factor))
+            # Penalise rotation/injury risk: every minute under 60 takes ~2% off.
+            risk_penalty = max(0.0, (60.0 - mins) * 0.02) if mins else 0.5
+            score = ep * mins_factor - risk_penalty
+            ranked.append({
+                "player_id": s["player_id"],
+                "web_name": s["web_name"],
+                "team_short": s["team_short"],
+                "squad_position": s["squad_position"],
+                "ep_next": round(ep, 2),
+                "expected_minutes_next": round(mins, 1),
+                "minutes_factor": round(mins_factor, 3),
+                "captain_score": round(score, 3),
+                "is_captain": bool(s["is_captain"]),
+                "is_vice_captain": bool(s["is_vice_captain"]),
+            })
+        ranked.sort(key=lambda r: r["captain_score"], reverse=True)
+
+        recommended = ranked[0]
+        current = next((r for r in ranked if r["is_captain"]), None)
+        # Captain doubles the EP, so the swing is 2× the EP gap.
+        swing_ep = round(2 * (recommended["ep_next"] - (current["ep_next"] if current else 0)), 2)
+
+        return {
+            "manager_id": manager_id,
+            "projection_event": projection_event,
+            "current_captain": current,
+            "recommended": recommended,
+            "swing_ep": swing_ep,
+            "should_switch": bool(current and recommended["player_id"] != current["player_id"] and swing_ep > 0.5),
+            "ranking": ranked,
+        }
+    finally:
+        if database is not None:
+            await database.close()

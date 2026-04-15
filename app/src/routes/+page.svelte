@@ -2,12 +2,14 @@
   import { onMount } from 'svelte';
   import {
     getAttribution,
+    getCaptainSuggestion,
     getFixtureExposure,
     getFplStatus,
     getPlayerDetail,
     getXray,
     getXrayForecast,
     getXrayWithLookback,
+    type CaptainSuggestion,
     type FplSessionStatus,
   } from '$lib/api';
   import { managerId, recentManagers, rememberManager, forgetManager } from '$lib/session';
@@ -49,6 +51,8 @@
   // fixture exposure
   let exposure: any = $state(null);
   let expLoading = $state(false);
+  let captain: CaptainSuggestion | null = $state(null);
+  let captainLoading = $state(false);
   let fplStatus = $state<FplSessionStatus | null>(null);
   let fplStatusLoading = $state(true);
   let authBootstrapping = $state(true);
@@ -115,6 +119,15 @@
     finally { expLoading = false; }
   }
 
+  async function loadCaptain(managerIdOverride?: number) {
+    const activeId = managerIdOverride ?? $managerId;
+    if (!activeId) return;
+    captainLoading = true;
+    try { captain = await getCaptainSuggestion(activeId); }
+    catch { captain = null; }
+    finally { captainLoading = false; }
+  }
+
   function rememberLoadedManager(id: number, snapshot: any) {
     rememberManager({
       id,
@@ -133,6 +146,7 @@
     error = '';
     data = null;
     exposure = null;
+    captain = null;
     selectedPlayer = null;
     playerDetail = null;
     try {
@@ -141,6 +155,7 @@
       managerId.set(id);
       rememberLoadedManager(id, snapshot);
       await loadFixtureExposure(id);
+      void loadCaptain(id);
     } catch (e: any) {
       error = e.message || 'Failed to sign in';
       data = null;
@@ -680,6 +695,62 @@
     <!-- Issues drawer (collapsible) -->
     {#if showIssues && analysisData.callouts?.length}
       <section class="fade-in" style="--i:2"><RiskCards callouts={analysisData.callouts} /></section>
+    {/if}
+
+    {#if captain && captain.recommended}
+      <section class="captain-card fade-in" style="--i:2">
+        <div class="cap-row">
+          <div class="cap-block">
+            <span class="eyebrow">Suggested captain</span>
+            <div class="cap-name">
+              <strong>{captain.recommended.web_name}</strong>
+              <span class="dim2 small">{captain.recommended.team_short}</span>
+            </div>
+            <div class="dim2 small">
+              {captain.recommended.ep_next.toFixed(1)} EP · {captain.recommended.expected_minutes_next}′ expected
+            </div>
+          </div>
+          {#if captain.current_captain}
+            <div class="cap-block">
+              <span class="eyebrow">Current armband</span>
+              <div class="cap-name">
+                <strong>{captain.current_captain.web_name}</strong>
+                <span class="dim2 small">{captain.current_captain.team_short}</span>
+              </div>
+              <div class="dim2 small">
+                {captain.current_captain.ep_next.toFixed(1)} EP
+              </div>
+            </div>
+          {/if}
+          <div class="cap-block cap-swing">
+            <span class="eyebrow">Swing if you switch</span>
+            <div class="cap-swing-val mono {captain.swing_ep > 0 ? 'positive' : ''}">
+              {captain.swing_ep > 0 ? '+' : ''}{captain.swing_ep.toFixed(1)} pts
+            </div>
+            {#if captain.should_switch}
+              <div class="dim small">Worth swapping the armband.</div>
+            {:else if captain.current_captain && captain.recommended.player_id === captain.current_captain.player_id}
+              <div class="dim small">You already have the right captain.</div>
+            {:else}
+              <div class="dim small">Marginal — current armband is close enough.</div>
+            {/if}
+          </div>
+        </div>
+        {#if captain.ranking?.length > 1}
+          <details class="cap-ranking">
+            <summary class="dim2 small">Show full ranking</summary>
+            <ol class="cap-list">
+              {#each captain.ranking.slice(0, 5) as r, i}
+                <li>
+                  <span class="cap-rank">{i + 1}</span>
+                  <span class="cap-list-name">{r.web_name} <span class="dim2 small">({r.team_short})</span></span>
+                  <span class="mono dim2">{r.ep_next.toFixed(1)} EP · {r.expected_minutes_next}′</span>
+                </li>
+              {/each}
+            </ol>
+          </details>
+        {/if}
+      </section>
     {/if}
 
     <!-- ═════ DESK NOTES ═════ -->
@@ -1634,6 +1705,33 @@
     flex-direction: column;
     gap: 0.1rem;
     min-width: 0;
+  }
+
+  .captain-card {
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-lg);
+    padding: 1rem 1.15rem;
+    margin-bottom: 1rem;
+  }
+  .cap-row { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+  .cap-block { display: flex; flex-direction: column; gap: 0.25rem; }
+  .cap-name { font-size: 1.1rem; line-height: 1.2; }
+  .cap-name strong { font-weight: 700; }
+  .cap-swing-val { font-size: 1.4rem; font-weight: 700; }
+  .cap-swing-val.positive { color: var(--accent-text); }
+  .cap-ranking { margin-top: 0.7rem; padding-top: 0.6rem; border-top: 1px dashed var(--line); }
+  .cap-ranking summary { cursor: pointer; }
+  .cap-list { margin: 0.5rem 0 0; padding-left: 0; list-style: none; display: flex; flex-direction: column; gap: 0.3rem; }
+  .cap-list li { display: grid; grid-template-columns: 24px 1fr auto; gap: 0.5rem; align-items: baseline; }
+  .cap-rank {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 22px; height: 22px; border-radius: 999px;
+    background: var(--bg-elevated); font-size: 0.7rem; font-family: var(--font-mono);
+  }
+  .cap-list-name { font-size: 0.86rem; }
+  @media (max-width: 720px) {
+    .cap-row { grid-template-columns: 1fr; }
   }
 
   /* ═════ DESK NOTES — tight, breathable stack ═════ */

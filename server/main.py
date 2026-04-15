@@ -272,6 +272,20 @@ async def team_xray(
         raise HTTPException(500, str(e))
 
 
+@app.get("/api/xray/{manager_id}/suggest-captain")
+async def suggest_captain(manager_id: int, event: int | None = None):
+    """Recommend the captain pick for the upcoming gameweek."""
+    try:
+        await _ensure_core_cache()
+        return await analysis.suggest_captain(manager_id, event)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
 @app.get("/api/xray/{manager_id}/attribution")
 async def correlation_attribution(
     manager_id: int,
