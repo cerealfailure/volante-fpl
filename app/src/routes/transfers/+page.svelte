@@ -13,6 +13,7 @@
     getManagerTransfers,
     getTransferAnalysis,
     recommendReplacements,
+    getSuggestedTransfers,
     simulateTransfer,
     simulateTransferPlan,
     getPlayers,
@@ -61,8 +62,15 @@
   let browsePlayers: any[] = $state([]);
   let browseLoading = $state(false);
 
-  // User-editable free-transfer count (FPL stores this but we default to 1)
+  // Free transfers from FPL (user can override locally after first sync).
   let freeTransfers = $state(1);
+  let freeTransfersTouched = $state(false);
+  let refreshing = $state(false);
+
+  // Proactive whole-squad suggestions
+  let suggestions: any[] = $state([]);
+  let suggestionsLoading = $state(false);
+  let suggestionsError = $state('');
 
   // History
   let history: any[] = $state([]);
@@ -72,13 +80,42 @@
   let transferAnalysisLoading = $state(false);
 
   // ── Load ─────────────────────────────────────────────────
+  async function loadXray(refresh = false) {
+    if (!$managerId) return;
+    if (refresh) refreshing = true; else xrayLoading = true;
+    xrayError = '';
+    try {
+      const d = await getXray($managerId, undefined, refresh);
+      xray = d;
+      const ft = d?.manager?.free_transfers;
+      if (ft != null && !freeTransfersTouched) freeTransfers = ft;
+    } catch (e: any) {
+      xrayError = e.message;
+    } finally {
+      xrayLoading = false;
+      refreshing = false;
+    }
+  }
+
+  async function loadSuggestions() {
+    if (!$managerId) return;
+    suggestionsLoading = true;
+    suggestionsError = '';
+    try {
+      const d = await getSuggestedTransfers($managerId, 5);
+      suggestions = d.suggestions ?? [];
+    } catch (e: any) {
+      suggestionsError = e.message || 'Failed to load suggestions';
+      suggestions = [];
+    } finally {
+      suggestionsLoading = false;
+    }
+  }
+
   $effect(() => {
     if (!$managerId) return;
-    xrayLoading = true;
-    getXray($managerId)
-      .then(d => { xray = d; })
-      .catch(e => xrayError = e.message)
-      .finally(() => xrayLoading = false);
+    loadXray(false);
+    loadSuggestions();
     getManagerTransfers($managerId, false)
       .then(d => history = d.transfers ?? [])
       .catch(() => {})
@@ -100,6 +137,30 @@
     greeted = true;
     gaffer.say('SUB BOARD IS OPEN. TAP PLAYERS TO DROP.');
   });
+
+  async function refreshFromFpl() {
+    if (refreshing) return;
+    await loadXray(true);
+    await loadSuggestions();
+    gaffer.say('SQUAD REFRESHED FROM FPL.');
+  }
+
+  async function applySuggestion(s: any) {
+    const sellPlayer = allPlayers.find((p: any) => p.id === s.sell_id);
+    if (!sellPlayer) return;
+    if (!dropIds.includes(s.sell_id)) {
+      dropIds = [...dropIds, s.sell_id];
+    }
+    activeDropId = s.sell_id;
+    browseMode = false;
+    await fetchRecs(dropIds);
+    await earmark(s.buy);
+    if (browser) {
+      setTimeout(() => {
+        document.querySelector('.plan-summary')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 60);
+    }
+  }
 
   // ── Computed ─────────────────────────────────────────────
   let starters = $derived((xray?.players ?? []).filter((p: any) => p.is_starter));
@@ -481,6 +542,24 @@
           <span class="dim2 small">£{bank.toFixed(1)}m bank + {nTransfers} sell price{nTransfers === 1 ? '' : 's'}</span>
         </div>
       </div>
+      <div class="ft-card">
+        <Icon.Swap size={14} />
+        <div>
+          <span class="stat-label">Free transfers</span>
+          <span class="bank-val mono">{xray?.manager?.free_transfers ?? '—'}</span>
+          <span class="dim2 small">
+            {#if xray?.manager?.event_transfers != null}
+              {xray.manager.event_transfers} made GW{xray.event}
+            {:else}
+              from FPL
+            {/if}
+          </span>
+        </div>
+      </div>
+      <button class="btn-ghost refresh-btn" onclick={refreshFromFpl} disabled={refreshing} title="Pull latest squad and transfer data from FPL">
+        <Icon.Stopwatch size={12} />
+        {refreshing ? 'Syncing…' : 'Refresh from FPL'}
+      </button>
       <div class="horizon-card">
         <span class="stat-label">Planning window</span>
         <div class="horizon-pills">
@@ -508,6 +587,66 @@
   {:else if xrayError}
     <p class="error-msg">{xrayError}</p>
   {:else if xray}
+    <section class="suggest-card card">
+      <div class="suggest-head">
+        <div>
+          <span class="eyebrow"><Icon.Goal size={12} /> Suggested moves</span>
+          <h2>Biggest upgrades available right now</h2>
+          <p class="dim small">
+            Ranked by expected points, fixture run, form, and diversification impact.
+            Load one to drop it straight into the planner.
+          </p>
+        </div>
+        <button class="btn-ghost small" onclick={loadSuggestions} disabled={suggestionsLoading}>
+          {suggestionsLoading ? 'Scanning…' : 'Rescan'}
+        </button>
+      </div>
+      {#if suggestionsLoading && !suggestions.length}
+        <p class="dim small">Scanning the squad for clean upgrades…</p>
+      {:else if suggestionsError}
+        <p class="error-msg small">{suggestionsError}</p>
+      {:else if suggestions.length === 0}
+        <p class="dim small">No clear one-move upgrades found right now.</p>
+      {:else}
+        <ul class="suggest-list">
+          {#each suggestions as s, i}
+            <li>
+              <button class="suggest-row" onclick={() => applySuggestion(s)} title="Load into planner">
+                <span class="suggest-rank mono">#{i + 1}</span>
+                <div class="suggest-swap">
+                  <div class="sg-side out">
+                    <span class="sg-label dim2">Out</span>
+                    <span class="sg-name">{s.sell_name}</span>
+                    <span class="sg-sub dim2 small">{s.sell_team} · {s.position} · £{s.sell_price.toFixed(1)}m</span>
+                  </div>
+                  <span class="sg-arrow" aria-hidden="true">→</span>
+                  <div class="sg-side in">
+                    <span class="sg-label dim2">In</span>
+                    <span class="sg-name">{s.buy.web_name}</span>
+                    <span class="sg-sub dim2 small">{s.buy.team_short} · £{s.buy.price.toFixed(1)}m · {s.buy.ep_next?.toFixed(1) ?? '—'} EP</span>
+                  </div>
+                </div>
+                <div class="suggest-deltas">
+                  <span class="mono {deltaClass(s.ep_delta, 'pos')}">{sign(s.ep_delta)} EP</span>
+                  <span class="mono dim2">{s.corr_delta >= 0 ? '+' : ''}{s.corr_delta.toFixed(2)} corr</span>
+                  <span class="mono accent">{s.score.toFixed(2)}</span>
+                </div>
+                {#if s.buy.fixture_strip?.length}
+                  <div class="suggest-fixtures">
+                    {#each s.buy.fixture_strip.slice(0, 5) as f}
+                      <span class="fx fdr-{f.difficulty}">
+                        {f.is_home ? '' : '@'}{f.opponent} GW{f.event}
+                      </span>
+                    {/each}
+                  </div>
+                {/if}
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+    </section>
+
     {#if dropIds.length > 0 && transferAlerts.length}
       <section class="planner-alerts fade-in">
         <div class="section-head">
@@ -799,8 +938,12 @@
                 min="0"
                 max="5"
                 bind:value={freeTransfers}
+                oninput={() => freeTransfersTouched = true}
                 class="ps-ft-input mono"
               />
+              {#if xray?.manager?.free_transfers != null && !freeTransfersTouched}
+                <span class="dim2 small">(FPL: {xray.manager.free_transfers})</span>
+              {/if}
             </label>
             <span class="ps-hit {hitCost > 0 ? 'negative' : 'dim2'}">
               Hit cost: {hitCost > 0 ? `-${hitCost}` : '0'} pts
@@ -989,7 +1132,8 @@
     align-items: stretch;
     gap: 0.75rem;
   }
-  .bank-card {
+  .bank-card,
+  .ft-card {
     display: flex;
     align-items: center;
     gap: 0.75rem;
@@ -1000,10 +1144,19 @@
     min-width: 180px;
     color: var(--accent-text);
   }
-  .bank-card > div {
+  .bank-card > div,
+  .ft-card > div {
     display: flex;
     flex-direction: column;
     gap: 0.15rem;
+  }
+  .refresh-btn {
+    align-self: center;
+    white-space: nowrap;
+  }
+  .refresh-btn:disabled {
+    opacity: 0.55;
+    cursor: wait;
   }
   .bank-val {
     font-family: var(--heading);
@@ -1045,6 +1198,102 @@
   }
   .planner-alerts {
     margin-bottom: 0.9rem;
+  }
+  .suggest-card {
+    padding: 1rem 1.1rem;
+    margin-bottom: 0.9rem;
+  }
+  .suggest-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 0.85rem;
+    margin-bottom: 0.75rem;
+    flex-wrap: wrap;
+  }
+  .suggest-head h2 {
+    margin: 0.18rem 0 0.25rem;
+    line-height: 1.05;
+  }
+  .suggest-list {
+    list-style: none;
+    padding: 0;
+    margin: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.45rem;
+  }
+  .suggest-row {
+    width: 100%;
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-rows: auto auto;
+    gap: 0.4rem 0.75rem;
+    align-items: center;
+    padding: 0.65rem 0.8rem;
+    background: color-mix(in srgb, var(--bg-elevated) 92%, transparent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    cursor: pointer;
+    text-align: left;
+    transition: all var(--duration) var(--ease);
+  }
+  .suggest-row:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+  }
+  .suggest-rank {
+    grid-row: 1 / span 2;
+    font-size: 1.05rem;
+    font-weight: 700;
+    color: var(--accent-text);
+    align-self: center;
+  }
+  .suggest-swap {
+    display: flex;
+    align-items: center;
+    gap: 0.7rem;
+    min-width: 0;
+  }
+  .sg-side {
+    display: flex;
+    flex-direction: column;
+    gap: 0.1rem;
+    min-width: 0;
+  }
+  .sg-label {
+    font-size: 0.62rem;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+  .sg-name {
+    font-weight: 700;
+    font-size: 0.92rem;
+    color: var(--text-heading);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .sg-sub {
+    white-space: nowrap;
+  }
+  .sg-arrow {
+    color: var(--accent);
+    font-size: 1.2rem;
+    font-weight: 700;
+  }
+  .suggest-deltas {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 0.14rem;
+    white-space: nowrap;
+  }
+  .suggest-fixtures {
+    grid-column: 2 / span 2;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.25rem;
   }
   .section-head {
     display: flex;
@@ -1634,7 +1883,7 @@
     .planner-grid { grid-template-columns: 1fr; }
     .planner-head h1 { font-size: 1.8rem; }
     .planner-tools { width: 100%; }
-    .bank-card, .horizon-card { width: 100%; }
+    .bank-card, .ft-card, .horizon-card { width: 100%; }
     .ps-body { grid-template-columns: 1fr; }
     .ps-deltas { grid-template-columns: repeat(2, 1fr); }
     .history-scorecard { grid-template-columns: 1fr; }

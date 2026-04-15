@@ -2,7 +2,8 @@ import { browser } from '$app/environment';
 
 const DEFAULT_API_PROTOCOL = browser ? window.location.protocol : 'http:';
 const DEFAULT_API_HOST = browser ? window.location.hostname : '127.0.0.1';
-const BASE = import.meta.env.VITE_API_BASE || `${DEFAULT_API_PROTOCOL}//${DEFAULT_API_HOST}:8555`;
+const DEFAULT_API_PORT = browser && window.location.port === '5555' ? '8555' : '8556';
+const BASE = import.meta.env.VITE_API_BASE || `${DEFAULT_API_PROTOCOL}//${DEFAULT_API_HOST}:${DEFAULT_API_PORT}`;
 
 function withQuery(path: string, params: Record<string, unknown> = {}) {
   const qs = new URLSearchParams();
@@ -29,8 +30,8 @@ export const syncAll = () => request('/api/sync', { method: 'POST' });
 export const syncManager = (id: number) =>
   request('/api/sync/manager', { method: 'POST', body: JSON.stringify({ manager_id: id }) });
 
-export const getXray = (id: number, lookback?: number) =>
-  request(withQuery(`/api/xray/${id}`, { lookback }));
+export const getXray = (id: number, lookback?: number, refresh = false) =>
+  request(withQuery(`/api/xray/${id}`, { lookback, refresh }));
 
 export const getXrayWithLookback = (id: number, lookback?: number) =>
   request(withQuery(`/api/xray/${id}`, { lookback }));
@@ -77,6 +78,8 @@ export const recommendReplacements = (mgr: number, sellIds: number[], n = 5, hor
   request(`/api/xray/${mgr}/recommend`, {
     method: 'POST', body: JSON.stringify({ sell_ids: sellIds, n, horizon }),
   });
+export const getSuggestedTransfers = (mgr: number, n = 5) =>
+  request(withQuery(`/api/xray/${mgr}/suggest`, { n }));
 export const getTransferAnalysis = (id: number) => request(`/api/manager/${id}/transfer-analysis`);
 
 export const getFixtureExposure = (mgr: number) => request(`/api/xray/${mgr}/fixtures`);

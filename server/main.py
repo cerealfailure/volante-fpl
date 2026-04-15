@@ -104,8 +104,17 @@ app = FastAPI(title="Volante", version="0.2.0", lifespan=lifespan)
 
 DEFAULT_ALLOW_ORIGINS = [
     "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://[::1]:5173",
     "http://localhost:5555",
+    "http://127.0.0.1:5555",
+    "http://[::1]:5555",
+    "http://localhost:5556",
+    "http://127.0.0.1:5556",
+    "http://[::1]:5556",
     "http://localhost:4173",
+    "http://127.0.0.1:4173",
+    "http://[::1]:4173",
 ]
 
 allow_origins = [
@@ -219,6 +228,7 @@ async def team_xray(
     event: int | None = None,
     lookback: int | None = Query(default=None, ge=1),
     future_weeks: int | None = Query(default=None, ge=1),
+    refresh: bool = Query(default=False),
 ):
     try:
         await _ensure_core_cache()
@@ -230,7 +240,7 @@ async def team_xray(
         finally:
             await conn.close()
 
-        if not squad or fpl.is_stale(mgr_sync, fpl.MANAGER_TTL):
+        if refresh or not squad or fpl.is_stale(mgr_sync, fpl.MANAGER_TTL):
             try:
                 await fpl.sync_manager(manager_id)
             except fpl.FplError as exc:
@@ -1108,6 +1118,36 @@ async def recommend_transfers(manager_id: int, req: RecommendRequest):
         return result
     except ValueError as e:
         raise HTTPException(400, str(e))
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        raise HTTPException(500, str(e))
+
+
+@app.get("/api/xray/{manager_id}/suggest")
+async def suggest_transfers(manager_id: int, n: int = Query(default=5, ge=1, le=15)):
+    """Proactive top-N transfer suggestions across the whole squad."""
+    try:
+        await _ensure_core_cache()
+        conn = await db.get_db()
+        try:
+            current = await db.get_current_event(conn)
+            squad = await db.get_manager_squad(conn, manager_id, current) if current else []
+            mgr_sync = await db.get_sync(conn, fpl.manager_sync_key(manager_id))
+        finally:
+            await conn.close()
+
+        if not squad or fpl.is_stale(mgr_sync, fpl.MANAGER_TTL):
+            try:
+                await fpl.sync_manager(manager_id)
+            except fpl.FplError as exc:
+                if not squad:
+                    raise _http_from_fpl_error(exc)
+
+        result = await transfers_engine.suggest_best_transfers(manager_id, n=n)
+        await _register_background_manager(manager_id, "suggest_transfers")
+        return result
+    except ValueError as e:
+        raise HTTPException(404, str(e))
     except Exception as e:
         import traceback; traceback.print_exc()
         raise HTTPException(500, str(e))

@@ -27,6 +27,6 @@ for label in com.thenameszinski.volante-api com.thenameszinski.volante-web; do
 done
 
 echo "Volante is running under launchd."
-echo "  Frontend: http://localhost:5555"
-echo "  API:      http://localhost:8555"
+echo "  Frontend: http://localhost:5556"
+echo "  API:      http://localhost:8556"
 echo "  Logs:     $LOG_DIR/volante-web.log and $LOG_DIR/volante-api.log"

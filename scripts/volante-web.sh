@@ -13,5 +13,5 @@ cd "$ROOT_DIR/app"
 
 exec "$NPM_BIN" run dev -- \
   --host "${VOLANTE_WEB_HOST:-127.0.0.1}" \
-  --port "${VOLANTE_WEB_PORT:-5555}" \
+  --port "${VOLANTE_WEB_PORT:-5556}" \
   --strictPort

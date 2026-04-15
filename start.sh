@@ -4,17 +4,17 @@ cd "$(dirname "$0")"
 
 echo "Starting Volante..."
 
-# Backend (port 8555)
+# Backend (port 8556)
 ./scripts/volante-api.sh &
 BACKEND_PID=$!
 
-# Frontend (port 5555)
+# Frontend (port 5556)
 ./scripts/volante-web.sh &
 FRONTEND_PID=$!
 
 echo ""
-echo "  Backend:  http://${VOLANTE_API_HOST:-127.0.0.1}:${VOLANTE_API_PORT:-8555}"
-echo "  Frontend: http://${VOLANTE_WEB_HOST:-127.0.0.1}:${VOLANTE_WEB_PORT:-5555}"
+echo "  Backend:  http://${VOLANTE_API_HOST:-127.0.0.1}:${VOLANTE_API_PORT:-8556}"
+echo "  Frontend: http://${VOLANTE_WEB_HOST:-127.0.0.1}:${VOLANTE_WEB_PORT:-5556}"
 echo ""
 echo "  Press Ctrl+C to stop both servers"
 

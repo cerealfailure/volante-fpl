@@ -774,6 +774,144 @@ async def _optimize_transfer_plans(
     return evaluated[:limit]
 
 
+async def suggest_best_transfers(
+    manager_id: int,
+    event: int | None = None,
+    n: int = 5,
+    horizon: int | None = None,
+    min_score: float = 0.5,
+) -> dict:
+    """
+    Proactive scan: find the best 1-for-1 upgrades across the whole squad.
+    """
+    database = await db.get_db()
+    try:
+        if event is None:
+            event = await db.get_current_event(database)
+        if event is None:
+            raise ValueError("No current event found — sync data first")
+
+        horizon = _normalize_horizon(horizon)
+        squad = await db.get_manager_squad(database, manager_id, event)
+        if not squad:
+            raise ValueError(f"No squad for manager {manager_id}")
+
+        mgr_rows = await database.execute_fetchall("SELECT * FROM manager_info WHERE id=?", (manager_id,))
+        bank = (dict(mgr_rows[0]).get("bank") or 0) / 10 if mgr_rows else 0
+
+        team_rows = await database.execute_fetchall("SELECT id, short_name, name FROM teams")
+        team_lookup = {row["id"]: dict(row) for row in team_rows}
+
+        all_rows = await database.execute_fetchall("""
+            SELECT p.*, t.short_name as team_short, t.name as team_name
+            FROM players p
+            JOIN teams t ON p.team_id = t.id
+            WHERE p.minutes > 0 AND p.status IN ('a', 'd')
+        """)
+        all_players = {row["id"]: dict(row) for row in all_rows}
+
+        projection_context = await projections.build_projection_context(database, event, horizon)
+        fixtures_by_team = projection_context["fixtures_by_team"]
+        availability_state = projection_context
+
+        squad_player_ids = {player["player_id"] for player in squad}
+        team_counts = Counter(player["team_id"] for player in squad)
+
+        suggestions = []
+        for sell_player in squad:
+            sell_id = sell_player["player_id"]
+            pos = sell_player["pos_type"]
+            sell_price = _player_price(sell_player)
+            slot_budget = sell_price + bank
+
+            keep_player_ids = squad_player_ids - {sell_id}
+            removed_player_ids = {sell_id}
+            base_team_counts = Counter(team_counts)
+            base_team_counts[sell_player["team_id"]] -= 1
+            if base_team_counts[sell_player["team_id"]] <= 0:
+                base_team_counts.pop(sell_player["team_id"], None)
+
+            best_row = None
+            for candidate in all_players.values():
+                if not _candidate_is_eligible(
+                    candidate,
+                    keep_player_ids,
+                    removed_player_ids,
+                    base_team_counts,
+                    pos,
+                ):
+                    continue
+                if _player_price(candidate) > slot_budget + 1e-9:
+                    continue
+
+                row = _build_candidate_record(
+                    candidate,
+                    sell_player,
+                    fixtures_by_team,
+                    team_lookup,
+                    event,
+                    base_team_counts,
+                    horizon,
+                    slot_budget,
+                    availability_state,
+                )
+                row["position"] = pos
+                row["xg"] = candidate.get("xg")
+                row["xa"] = candidate.get("xa")
+
+                if best_row is None:
+                    best_row = row
+                    continue
+
+                current_key = (
+                    row["score"],
+                    row["breakdown"]["projected_gain"],
+                    row["projected_ep"],
+                )
+                best_key = (
+                    best_row["score"],
+                    best_row["breakdown"]["projected_gain"],
+                    best_row["projected_ep"],
+                )
+                if current_key > best_key:
+                    best_row = row
+
+            if best_row is None or best_row["score"] < min_score:
+                continue
+
+            suggestions.append({
+                "sell_id": sell_id,
+                "sell_name": sell_player["web_name"],
+                "sell_team": sell_player.get("team_short", "???"),
+                "sell_price": round(sell_price, 1),
+                "sell_ep": sell_player.get("ep_next"),
+                "position": analysis.POS_NAMES.get(pos, "???"),
+                "buy": best_row,
+                "score": round(best_row["score"], 2),
+                "breakdown": best_row["breakdown"],
+                "ep_delta": best_row["breakdown"]["ep_delta"],
+                "corr_delta": best_row["breakdown"]["diversification"],
+            })
+
+        suggestions.sort(
+            key=lambda row: (
+                row["score"],
+                row["breakdown"]["projected_gain"],
+                row["buy"]["projected_ep"],
+            ),
+            reverse=True,
+        )
+        return {
+            "suggestions": suggestions[:n],
+            "bank": bank,
+            "event": event,
+            "projection_event": projection_context["target_event"],
+            "scanned": len(squad),
+        }
+    finally:
+        await database.close()
+
+
 async def recommend_replacements(
     manager_id: int,
     sell_player_ids: list[int],

@@ -20,9 +20,9 @@ CONCURRENCY = 5
 BATCH_DELAY = 0.1
 
 CORE_DATA_TTL = timedelta(hours=6)
-MANAGER_TTL = timedelta(minutes=30)
+MANAGER_TTL = timedelta(minutes=5)
 MANAGER_LEAGUES_TTL = timedelta(hours=6)
-MANAGER_TRANSFERS_TTL = timedelta(minutes=15)
+MANAGER_TRANSFERS_TTL = timedelta(minutes=5)
 LEAGUE_PAGE_TTL = timedelta(minutes=15)
 
 FplError = fpl_client.FplError
@@ -80,14 +80,38 @@ async def ensure_core_data(force: bool = False):
         await sync_fixtures()
 
 
-async def _persist_manager_snapshot(conn, manager_id: int, info: dict) -> list[dict]:
-    await db.upsert_manager(conn, info)
+async def _persist_manager_snapshot(
+    conn,
+    manager_id: int,
+    info: dict,
+    free_transfers: int | None = None,
+    event_transfers: int | None = None,
+) -> list[dict]:
+    last_synced = datetime.now(timezone.utc).isoformat()
+    await db.upsert_manager(
+        conn,
+        info,
+        free_transfers=free_transfers,
+        event_transfers=event_transfers,
+        last_synced=last_synced,
+    )
     classic_leagues = ((info.get("leagues") or {}).get("classic") or [])
     await db.replace_manager_leagues(conn, manager_id, classic_leagues)
     await db.set_sync(conn, manager_leagues_sync_key(manager_id), {
         "count": len(classic_leagues),
     })
     return classic_leagues
+
+
+def _compute_free_transfers(history_current: list[dict]) -> int:
+    """
+    Derive remaining free transfers going into the next deadline.
+    """
+    ft = 0
+    for row in sorted(history_current or [], key=lambda r: r.get("event") or 0):
+        ft = min(5, ft + 1)
+        ft = max(0, ft - (row.get("event_transfers") or 0))
+    return min(5, ft + 1)
 
 
 # ── Sync pipeline ────────────────────────────────────────────────────
@@ -271,7 +295,6 @@ async def sync_manager(manager_id: int, include_histories: bool = True, include_
     try:
         async with _session() as session:
             info = await fetch_manager(session, manager_id)
-            leagues = await _persist_manager_snapshot(conn, manager_id, info)
             event = info.get("current_event")
             if not event:
                 raise FplBadResponse(f"Manager {manager_id} missing current_event")
@@ -281,6 +304,22 @@ async def sync_manager(manager_id: int, include_histories: bool = True, include_
             if not picks:
                 raise FplBadResponse(f"Manager {manager_id} returned no picks for GW{event}")
             await db.upsert_manager_picks(conn, manager_id, event, picks)
+
+            event_transfers = (picks_data.get("entry_history") or {}).get("event_transfers") or 0
+            free_transfers = None
+            try:
+                history = await fetch_manager_history(session, manager_id)
+                free_transfers = _compute_free_transfers(history.get("current") or [])
+            except FplError:
+                pass
+
+            leagues = await _persist_manager_snapshot(
+                conn,
+                manager_id,
+                info,
+                free_transfers=free_transfers,
+                event_transfers=event_transfers,
+            )
 
             transfers = []
             if include_transfers:

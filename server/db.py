@@ -151,7 +151,10 @@ CREATE TABLE IF NOT EXISTS manager_info (
     overall_rank    INTEGER,
     current_event   INTEGER,
     bank            INTEGER,  -- tenths
-    team_value      INTEGER  -- tenths
+    team_value      INTEGER,  -- tenths
+    free_transfers  INTEGER,  -- FTs banked going into next deadline
+    event_transfers INTEGER,  -- transfers made in current GW
+    last_synced     TEXT      -- ISO timestamp of last FPL fetch
 );
 
 CREATE TABLE IF NOT EXISTS manager_leagues (
@@ -429,6 +432,15 @@ async def init_db():
     db = await get_db()
     try:
         await db.executescript(SCHEMA)
+        for col, decl in [
+            ("free_transfers", "INTEGER"),
+            ("event_transfers", "INTEGER"),
+            ("last_synced", "TEXT"),
+        ]:
+            try:
+                await db.execute(f"ALTER TABLE manager_info ADD COLUMN {col} {decl}")
+            except Exception:
+                pass
         await db.commit()
     finally:
         await db.close()
@@ -522,18 +534,25 @@ async def upsert_player_gws(db: aiosqlite.Connection, player_id: int, history: l
     ) for h in history])
 
 
-async def upsert_manager(db: aiosqlite.Connection, info: dict):
+async def upsert_manager(
+    db: aiosqlite.Connection,
+    info: dict,
+    free_transfers: int | None = None,
+    event_transfers: int | None = None,
+    last_synced: str | None = None,
+):
     await db.execute("""
         INSERT OR REPLACE INTO manager_info
         (id, team_name, player_name, overall_points, overall_rank,
-         current_event, bank, team_value)
-        VALUES (?,?,?,?,?,?,?,?)
+         current_event, bank, team_value, free_transfers, event_transfers, last_synced)
+        VALUES (?,?,?,?,?,?,?,?,?,?,?)
     """, (
         info["id"], info.get("name"),
         f"{info.get('player_first_name','')} {info.get('player_last_name','')}".strip(),
         info.get("summary_overall_points"), info.get("summary_overall_rank"),
         info.get("current_event"),
         info.get("last_deadline_bank"), info.get("last_deadline_value"),
+        free_transfers, event_transfers, last_synced,
     ))
 
 
