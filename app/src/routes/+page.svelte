@@ -485,9 +485,9 @@
           </p>
         {:else}
           <ol class="live-cookie-steps">
-            <li>Log in at <code>fantasy.premierleague.com</code>.</li>
-            <li>DevTools → <b>Application</b> → <b>Cookies</b> → copy <code>pl_profile</code> and <code>sessionid</code>.</li>
-            <li>Open <a href="/settings">Settings</a> and paste <code>pl_profile=&lt;value&gt;; sessionid=&lt;value&gt;</code>.</li>
+            <li>Log in at <code>fantasy.premierleague.com</code> in Chrome.</li>
+            <li>Open Chrome DevTools on the official FPL site, not inside Volante: <b>Application</b> → <b>Cookies</b> → <b>https://fantasy.premierleague.com</b>.</li>
+            <li>Copy <code>pl_profile</code> and <code>sessionid</code>, then open <a href="/settings">Settings</a> and paste <code>pl_profile=&lt;value&gt;; sessionid=&lt;value&gt;</code>.</li>
           </ol>
         {/if}
 

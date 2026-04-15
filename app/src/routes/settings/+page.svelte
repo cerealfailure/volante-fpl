@@ -118,7 +118,7 @@
 
     <ol class="steps">
       <li>Log in at <code>fantasy.premierleague.com</code> in Chrome.</li>
-      <li>Open DevTools (<kbd>⌥⌘I</kbd>) → <b>Application</b> tab → <b>Cookies</b> → <b>https://fantasy.premierleague.com</b>.</li>
+      <li>Open Chrome DevTools on the official FPL site, not inside Volante FPL: <kbd>⌥⌘I</kbd> → <b>Application</b> tab → <b>Cookies</b> → <b>https://fantasy.premierleague.com</b>.</li>
       <li>Find these and copy their values:
         <ul class="cookie-list">
           <li><code>pl_profile</code> <span class="dim2">(required — scope <code>.premierleague.com</code>)</span></li>

@@ -28,6 +28,12 @@ git switch -c fpl-cookie-first-20260415 --track origin/fpl-cookie-first-20260415
 ./scripts/install-volante-launchd.sh
 ```
 
+Live session setup note:
+
+- when the app says `DevTools`, it means your browser's developer tools on `https://fantasy.premierleague.com`, not anything inside Volante FPL
+- in Chrome: `Option` + `Command` + `I` on macOS, then `Application` -> `Cookies` -> `https://fantasy.premierleague.com`
+- copy `pl_profile` and `sessionid`, then paste them into `http://127.0.0.1:5556/settings`
+
 The repo is now split into two modes:
 
 - `fpl_only`: default, safe to clone and run from GitHub, no private intel HTTP surface
