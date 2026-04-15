@@ -141,8 +141,10 @@ class SyncManagerRequest(BaseModel):
 
 
 class FplCookieRequest(BaseModel):
-    # Raw pasted cookie text: either a bare pl_profile value, or a full
-    # "pl_profile=...; csrftoken=..." header. Parsed server-side.
+    # Raw pasted cookie text. Either a full cookie header (PingOne accounts:
+    # "access_token=...; refresh_token=...; datadome=..."; legacy accounts:
+    # "pl_profile=...; sessionid=...") or a bare credential value treated as
+    # access_token. Parsed server-side.
     raw: str
 
 class TransferSimRequest(BaseModel):
@@ -777,8 +779,7 @@ async def _validate_cookie_for_account(jar: dict[str, str]) -> int:
     both explicit 401/403 and silent "bogus cookie → anonymous JSON" cases
     DataDome sometimes produces.
     """
-    async with fpl._authed_session(jar) as session:
-        me = await fpl.fetch_me(session)
+    me = await fpl.fetch_me(jar)
     player = me.get("player") or {}
     entry = player.get("entry")
     if not isinstance(entry, int):
@@ -799,8 +800,12 @@ async def settings_set_fpl_cookie(req: FplCookieRequest, request: Request):
     """
     _require_loopback(request)
     parsed = fpl_auth.parse_cookie_input(req.raw)
-    if fpl_auth.REQUIRED_FOR_READS not in parsed:
-        raise HTTPException(400, f"Cookie input must include {fpl_auth.REQUIRED_FOR_READS}")
+    if not fpl_auth.has_credential(parsed):
+        raise HTTPException(
+            400,
+            "Cookie input must include access_token (new auth flow) "
+            "or pl_profile (legacy accounts).",
+        )
     try:
         account_id = await _validate_cookie_for_account(parsed)
     except fpl.FplAuthRequired:
@@ -854,8 +859,7 @@ async def live_squad(manager_id: int):
         })
 
     try:
-        async with fpl._authed_session(jar) as session:
-            raw = await fpl.fetch_my_team(session, manager_id)
+        raw = await fpl.fetch_my_team(jar, manager_id)
     except fpl.FplAuthRequired:
         fpl_auth.audit(f"/my-team/{manager_id}/", manager_id, 401)
         raise HTTPException(428, detail={

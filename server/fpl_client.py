@@ -15,6 +15,11 @@ from typing import Any
 import aiohttp
 import certifi
 
+# curl_cffi mimics a real Chrome TLS fingerprint, which DataDome and FPL's
+# edge use to gate authenticated traffic. Without it, server-side requests
+# get back 200 with anonymous payloads even when the cookies are valid.
+from curl_cffi.requests import AsyncSession as _CurlSession
+
 BASE = "https://fantasy.premierleague.com/api"
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5, sock_connect=5, sock_read=15)
 MAX_RETRIES = 3
@@ -64,22 +69,26 @@ def _session() -> aiohttp.ClientSession:
     return aiohttp.ClientSession(connector=connector, headers=headers, timeout=REQUEST_TIMEOUT)
 
 
-def _authed_session(cookies: dict[str, str]) -> aiohttp.ClientSession:
+def _build_authed_headers(cookies: dict[str, str]) -> dict[str, str]:
     """
-    Session that carries the user's FPL cookies. Attach ONLY to fantasy.premierleague.com
-    authenticated paths (my-team/, me/). Do not reuse for public endpoints.
+    Headers for an authenticated FPL request. Empirically:
+      - PingOne accounts: FPL validates `Authorization: Bearer <access_token>`.
+        The access_token cookie alone is treated as anonymous.
+      - Legacy accounts: FPL validates the `pl_profile` cookie.
+    We send both forms so the same code works for both account types.
     """
     cookie_header = "; ".join(f"{k}={v}" for k, v in cookies.items() if v)
     headers = {
         "Accept": "application/json",
         "Accept-Language": "en-GB,en;q=0.9",
-        "User-Agent": _BROWSER_UA,
         "Referer": "https://fantasy.premierleague.com/",
         "Origin": "https://fantasy.premierleague.com",
         "Cookie": cookie_header,
     }
-    connector = aiohttp.TCPConnector(ssl=_ssl_ctx)
-    return aiohttp.ClientSession(connector=connector, headers=headers, timeout=REQUEST_TIMEOUT)
+    access_token = cookies.get("access_token")
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+    return headers
 
 
 def _backoff_delay(attempt: int) -> float:
@@ -204,22 +213,76 @@ async def fetch_live_gameweek(session: aiohttp.ClientSession, event_id: int) -> 
     return data
 
 
-# ── Authenticated endpoints (require a session built by _authed_session) ────
+# ── Authenticated endpoints ─────────────────────────────────────────────────
+#
+# These go through curl_cffi with a Chrome TLS impersonation. FPL's edge
+# (DataDome) checks the TLS fingerprint and ignores valid cookies if the
+# handshake doesn't look like a real browser, returning 200 with an
+# anonymous payload. aiohttp's fingerprint trips that gate.
 
-async def fetch_my_team(session: aiohttp.ClientSession, manager_id: int) -> dict[str, Any]:
+
+async def _authed_get_json(cookies: dict[str, str], path: str) -> Any:
+    """One-off authenticated GET using a Chrome-impersonating TLS session."""
+    url = f"{BASE}/{path.lstrip('/')}"
+    headers = _build_authed_headers(cookies)
+    last_error: Exception | None = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            async with _CurlSession(impersonate="chrome") as s:
+                r = await s.get(url, headers=headers, timeout=15)
+            if r.status_code == 404:
+                raise FplNotFound(f"FPL resource not found: {path}")
+            if r.status_code in (401, 403):
+                raise FplAuthRequired(
+                    f"FPL auth required for {path} (status {r.status_code})"
+                )
+            if r.status_code == 429:
+                last_error = FplRateLimited(f"FPL rate limited request: {path}")
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_backoff_delay(attempt))
+                    continue
+                raise last_error
+            if r.status_code >= 500:
+                last_error = FplUpstreamUnavailable(
+                    f"FPL upstream error {r.status_code}: {path}"
+                )
+                if attempt < MAX_RETRIES - 1:
+                    await asyncio.sleep(_backoff_delay(attempt))
+                    continue
+                raise last_error
+            if r.status_code != 200:
+                snippet = (r.text or "")[:200]
+                raise FplBadResponse(
+                    f"FPL API {r.status_code} for {path}: {snippet}"
+                )
+            return r.json()
+        except (FplNotFound, FplBadResponse, FplAuthRequired):
+            raise
+        except Exception as exc:
+            last_error = FplUpstreamUnavailable(f"FPL upstream unavailable for {path}")
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(_backoff_delay(attempt))
+                continue
+            raise last_error from exc
+    if last_error:
+        raise last_error
+
+
+async def fetch_my_team(cookies: dict[str, str], manager_id: int) -> dict[str, Any]:
     """
     Live (pre-deadline) team state: picks, chips staged, transfers remaining,
-    live bank and team value. Requires a valid pl_profile cookie.
+    live bank and team value. Requires a valid auth credential (access_token
+    for PingOne accounts, or pl_profile for legacy).
     """
-    data = await _request_json(session, f"my-team/{manager_id}/")
+    data = await _authed_get_json(cookies, f"my-team/{manager_id}/")
     if not isinstance(data, dict):
         raise FplBadResponse(f"my-team/{manager_id} returned a non-object payload")
     return data
 
 
-async def fetch_me(session: aiohttp.ClientSession) -> dict[str, Any]:
+async def fetch_me(cookies: dict[str, str]) -> dict[str, Any]:
     """Validate a cookie: /me/ returns the owning account's player.entry.id."""
-    data = await _request_json(session, "me/")
+    data = await _authed_get_json(cookies, "me/")
     if not isinstance(data, dict):
         raise FplBadResponse("me/ returned a non-object payload")
     return data

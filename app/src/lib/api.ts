@@ -101,7 +101,9 @@ export const getPredictionAccuracy = (mgr: number, weeks = 6) =>
 // ── FPL Session (cookie-paste live state) ───────────────────────
 export type FplSessionStatus = {
   connected: boolean;
+  auth_mode: 'pingone' | 'legacy' | null;
   has_csrf: boolean;
+  has_datadome: boolean;
   account_id: number | null;
   stored_at: string | null;
   last_validated_at: string | null;

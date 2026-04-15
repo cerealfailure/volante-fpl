@@ -33,7 +33,7 @@ FplRateLimited = fpl_client.FplRateLimited
 FplAuthRequired = fpl_client.FplAuthRequired
 
 _session = fpl_client._session
-_authed_session = fpl_client._authed_session
+_build_authed_headers = fpl_client._build_authed_headers
 fetch_bootstrap = fpl_client.fetch_bootstrap
 fetch_fixtures = fpl_client.fetch_fixtures
 fetch_player_history = fpl_client.fetch_player_history
@@ -315,6 +315,24 @@ async def sync_manager(manager_id: int, include_histories: bool = True, include_
             picks = picks_data.get("picks") or []
             if not picks:
                 raise FplBadResponse(f"Manager {manager_id} returned no picks for GW{event}")
+
+            # Public entry/{id}/event/{event}/picks/ only reflects picks at the
+            # last deadline lock. Pre-deadline transfers don't show until the
+            # next lock. If the user has a connected live session, override the
+            # public picks with their live my-team/ shape so the rest of Volante
+            # (xray, exposure, recommendations) sees their actual current XV.
+            try:
+                import fpl_auth  # local import to avoid cycle
+                jar = fpl_auth.get_cookie_jar()
+                stored = fpl_auth.load_cookies() or {}
+                if jar and stored.get("account_id") == manager_id:
+                    live = await fetch_my_team(jar, manager_id)
+                    live_picks = live.get("picks") or []
+                    if live_picks:
+                        picks = live_picks
+            except FplError:
+                pass  # any live failure → fall back to confirmed picks
+
             await db.upsert_manager_picks(conn, manager_id, event, picks)
 
             event_transfers = (picks_data.get("entry_history") or {}).get("event_transfers") or 0

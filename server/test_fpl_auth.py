@@ -12,6 +12,7 @@ from pathlib import Path
 
 import pytest
 
+import fpl
 import fpl_auth
 
 
@@ -26,13 +27,26 @@ def _isolated_fulcrum(monkeypatch, tmp_path):
 
 # ── parse_cookie_input ───────────────────────────────────────────────
 
-def test_parse_bare_pl_profile_value():
+def test_parse_bare_value_treated_as_access_token():
     out = fpl_auth.parse_cookie_input("eyJhbGciOi.deadbeef.signature")
-    assert out == {"pl_profile": "eyJhbGciOi.deadbeef.signature"}
+    assert out == {"access_token": "eyJhbGciOi.deadbeef.signature"}
 
 
-def test_parse_full_cookie_header():
-    raw = 'pl_profile=abc123; csrftoken=xyz789; sessionid=dj-session; datadome=dd-token'
+def test_parse_full_cookie_header_pingone():
+    raw = (
+        "access_token=eyJ-modern; refresh_token=rf-xyz; "
+        "datadome=dd-token; _ga=evil"
+    )
+    out = fpl_auth.parse_cookie_input(raw)
+    assert out == {
+        "access_token": "eyJ-modern",
+        "refresh_token": "rf-xyz",
+        "datadome": "dd-token",
+    }
+
+
+def test_parse_full_cookie_header_legacy():
+    raw = "pl_profile=abc123; csrftoken=xyz789; sessionid=dj-session; datadome=dd-token"
     out = fpl_auth.parse_cookie_input(raw)
     assert out == {
         "pl_profile": "abc123",
@@ -43,8 +57,8 @@ def test_parse_full_cookie_header():
 
 
 def test_parse_ignores_unknown_keys():
-    out = fpl_auth.parse_cookie_input("pl_profile=a; _ga=evil; __cfduid=tracker")
-    assert out == {"pl_profile": "a"}
+    out = fpl_auth.parse_cookie_input("access_token=a; _ga=evil; __cfduid=tracker")
+    assert out == {"access_token": "a"}
 
 
 def test_parse_strips_quotes_and_whitespace():
@@ -73,9 +87,31 @@ def test_save_and_load_roundtrip():
     assert data["last_validated_at"]
 
 
-def test_save_rejects_missing_pl_profile():
-    with pytest.raises(ValueError, match="pl_profile"):
-        fpl_auth.save_cookies({"csrftoken": "only-csrf"})
+def test_save_rejects_missing_credential():
+    with pytest.raises(ValueError, match="credential"):
+        fpl_auth.save_cookies({"csrftoken": "only-csrf", "datadome": "dd"})
+
+
+def test_save_accepts_access_token_alone():
+    fpl_auth.save_cookies({"access_token": "eyJ-modern"}, account_id=3174196)
+    data = fpl_auth.load_cookies()
+    assert data["cookies"] == {"access_token": "eyJ-modern"}
+    assert data["account_id"] == 3174196
+
+
+def test_get_status_reports_pingone_mode():
+    fpl_auth.save_cookies({"access_token": "eyJ-modern", "datadome": "dd"}, account_id=42)
+    s = fpl_auth.get_status()
+    assert s["connected"] is True
+    assert s["auth_mode"] == "pingone"
+    assert s["has_datadome"] is True
+
+
+def test_get_status_reports_legacy_mode():
+    fpl_auth.save_cookies({"pl_profile": "old-jwt"}, account_id=42)
+    s = fpl_auth.get_status()
+    assert s["connected"] is True
+    assert s["auth_mode"] == "legacy"
 
 
 def test_save_strips_disallowed_keys():
@@ -206,6 +242,32 @@ def test_load_tolerates_wrong_shape(tmp_path):
     assert fpl_auth.load_cookies() is None
 
 
-def test_get_cookie_jar_rejects_missing_pl_profile(tmp_path):
+def test_get_cookie_jar_rejects_missing_credential(tmp_path):
     fpl_auth.COOKIE_FILE.write_text(json.dumps({"cookies": {"csrftoken": "only"}}))
     assert fpl_auth.get_cookie_jar() is None
+
+
+def test_authed_headers_send_bearer_for_pingone():
+    # Empirically (Apr 2026): FPL's /api/me/ validates Authorization: Bearer for
+    # PingOne accounts. The access_token cookie alone returns 200 with
+    # {"player": null} — the cookie is recognized but treated as anonymous.
+    h = fpl._build_authed_headers({"access_token": "eyJ-modern", "datadome": "dd"})
+    assert h["Authorization"] == "Bearer eyJ-modern"
+    assert "access_token=eyJ-modern" in h["Cookie"]
+    assert "datadome=dd" in h["Cookie"]
+
+
+def test_authed_headers_legacy_pl_profile_cookie_only():
+    # Legacy accounts authenticate via the pl_profile cookie; no Bearer needed.
+    h = fpl._build_authed_headers({"pl_profile": "old-jwt", "sessionid": "dj"})
+    assert "Authorization" not in h
+    assert "pl_profile=old-jwt" in h["Cookie"]
+    assert "sessionid=dj" in h["Cookie"]
+
+
+def test_get_cookie_jar_accepts_access_token(tmp_path):
+    fpl_auth.COOKIE_FILE.write_text(json.dumps({
+        "cookies": {"access_token": "eyJ-modern", "datadome": "dd"},
+    }))
+    jar = fpl_auth.get_cookie_jar()
+    assert jar == {"access_token": "eyJ-modern", "datadome": "dd"}

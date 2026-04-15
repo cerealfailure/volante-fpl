@@ -95,12 +95,14 @@
       <dl class="kv">
         <dt>Account</dt>
         <dd>#{status.account_id ?? '—'}</dd>
+        <dt>Auth mode</dt>
+        <dd>{status.auth_mode === 'pingone' ? 'PingOne (access_token)' : status.auth_mode === 'legacy' ? 'Legacy (pl_profile)' : '—'}</dd>
         <dt>Stored</dt>
         <dd>{fmtTime(status.stored_at)}</dd>
         <dt>Last validated</dt>
         <dd>{fmtTime(status.last_validated_at)}</dd>
-        <dt>CSRF present</dt>
-        <dd>{status.has_csrf ? 'yes (for Phase 2 writes)' : 'no (reads still work)'}</dd>
+        <dt>DataDome token</dt>
+        <dd>{status.has_datadome ? 'present (helps avoid bot challenges)' : 'absent'}</dd>
       </dl>
       <div class="row">
         <button class="btn-ghost danger" onclick={onDisconnect}>Disconnect</button>
@@ -113,28 +115,94 @@
 
   <section class="card paste-card reveal" style="--i:2">
     <header class="card-head">
-      <h2>{status?.connected ? 'Re-paste cookie' : 'Paste cookie'}</h2>
+      <h2>{status?.connected ? 'Re-connect (token expired)' : 'Connect your live FPL session — 5 steps'}</h2>
     </header>
 
-    <ol class="steps">
-      <li>Log in at <code>fantasy.premierleague.com</code> in Chrome.</li>
-      <li>Open Chrome DevTools on the official FPL site, not inside Volante FPL: <kbd>⌥⌘I</kbd> → <b>Application</b> tab → <b>Cookies</b> → <b>https://fantasy.premierleague.com</b>.</li>
-      <li>Find these and copy their values:
-        <ul class="cookie-list">
-          <li><code>pl_profile</code> <span class="dim2">(required — scope <code>.premierleague.com</code>)</span></li>
-          <li><code>sessionid</code> <span class="dim2">(strongly recommended — scope <code>fantasy.premierleague.com</code>)</span></li>
-          <li><code>datadome</code> <span class="dim2">(include if present — avoids bot challenges)</span></li>
-        </ul>
+    <p class="caveat">
+      The cookie panel in DevTools <b>does not work</b> for FPL accounts
+      created since 2025. The real session token lives in
+      <code>localStorage</code>. Follow the steps below exactly — copy the
+      whole one-liner including the leading <code>copy(</code>.
+    </p>
+
+    <ol class="steps big-steps">
+      <li>
+        <div class="step-title">Open FPL and log in</div>
+        <div class="step-body">
+          Go to <a href="https://fantasy.premierleague.com/my-team" target="_blank" rel="noopener">https://fantasy.premierleague.com/my-team</a>
+          in Chrome (or any Chromium browser) and make sure your team page
+          loads. If it asks for a password, log in.
+        </div>
       </li>
-      <li>Paste below. You can paste a full <code>pl_profile=...; sessionid=...</code> string or just the <code>pl_profile</code> value on its own.</li>
-      <li>Click <b>Test & Save</b>. Volante will ping FPL's <code>/me/</code> once to confirm the cookie works and to capture which account it belongs to.</li>
+
+      <li>
+        <div class="step-title">Open DevTools — on the FPL tab, not on Volante</div>
+        <div class="step-body">
+          Press <kbd>⌥</kbd>+<kbd>⌘</kbd>+<kbd>I</kbd> (macOS) or
+          <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> (Windows / Linux).
+          A panel will open at the bottom or side of the FPL page.
+        </div>
+      </li>
+
+      <li>
+        <div class="step-title">Click the <b>Console</b> tab inside DevTools</div>
+        <div class="step-body">
+          Across the top of the DevTools panel you'll see tabs:
+          <code>Elements</code> · <code>Console</code> · <code>Sources</code> ·
+          <code>Network</code> · <code>Application</code> · …
+          Click <b>Console</b>. You'll see a blinking <code>&gt;</code> prompt.
+        </div>
+      </li>
+
+      <li>
+        <div class="step-title">Paste this <i>entire line</i> into the Console and press Enter</div>
+        <div class="step-body">
+          <pre class="snippet">copy('access_token=' + JSON.parse(localStorage[Object.keys(localStorage).find(k=&gt;k.startsWith('oidc.user:'))]).access_token)</pre>
+          <button class="btn-ghost small copy-btn" onclick={() => navigator.clipboard.writeText("copy('access_token=' + JSON.parse(localStorage[Object.keys(localStorage).find(k=>k.startsWith('oidc.user:'))]).access_token)")}>
+            Copy snippet to clipboard
+          </button>
+          <p class="step-note">
+            The Console will print <code>undefined</code> — that's normal.
+            What matters is that your clipboard now holds
+            <code>access_token=eyJhbG…</code> (a long string starting with
+            <code>access_token=eyJ</code>).
+            <br>
+            <b>If you see <code>SyntaxError</code> or <code>TypeError</code>:</b>
+            you're not actually logged in to FPL — go back to step 1.
+          </p>
+        </div>
+      </li>
+
+      <li>
+        <div class="step-title">Paste into the box below and click <b>Test & Save</b></div>
+        <div class="step-body">
+          Volante will ping FPL once with the token, confirm it belongs to
+          you, and unlock the live squad / bank / free-transfer count.
+          You should see the <b>Connection</b> chip above flip to
+          <span class="chip chip-ok inline-chip">connected</span>.
+        </div>
+      </li>
     </ol>
 
+    <details class="legacy">
+      <summary>I have an old FPL account (pre-2025) — show the legacy <code>pl_profile</code> path</summary>
+      <ol class="steps">
+        <li>DevTools → <b>Application</b> tab → <b>Cookies</b> → click
+          <code>https://fantasy.premierleague.com</code>.</li>
+        <li>Find the rows <code>pl_profile</code> and <code>sessionid</code>.
+          Copy each <b>Value</b>.</li>
+        <li>Build one line:
+          <pre class="snippet">pl_profile=&lt;value&gt;; sessionid=&lt;value&gt;</pre>
+          and paste it below.</li>
+        <li>Click <b>Test & Save</b>.</li>
+      </ol>
+    </details>
+
     <label class="field">
-      <span class="label-text">Cookie</span>
+      <span class="label-text">Paste your token here</span>
       <textarea
         bind:value={cookieInput}
-        placeholder={'pl_profile=eyJ...; sessionid=dj-... '}
+        placeholder="access_token=eyJhbG..."
         autocomplete="off"
         spellcheck="false"
         rows="4"
@@ -149,8 +217,10 @@
         {saving ? 'Validating…' : 'Test & Save'}
       </button>
       <p class="hint">
-        Cookie is stored at <code>~/.fulcrum/fpl_session.json</code> with <code>0600</code> perms.
-        Never echoed back, never logged, never in the repo.
+        Stored at <code>~/.fulcrum/fpl_session.json</code> with <code>0600</code>
+        perms. Never echoed, never logged, never in the repo.
+        <b>Token expires every few hours</b> — when it does, just rerun the
+        same one-liner and re-paste.
       </p>
     </div>
   </section>
@@ -208,8 +278,53 @@
   .steps li { margin-bottom: 0.35rem; }
   .steps code { background: var(--bg-elevated); padding: 1px 5px; border-radius: 3px; }
   kbd { background: var(--bg-elevated); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; font-family: inherit; font-size: 0.82em; }
-  .cookie-list { margin: 0.3rem 0 0.4rem 0; padding-left: 1.2rem; }
-  .cookie-list li { margin-bottom: 0.15rem; }
+  .caveat {
+    margin: 0 0 0.8rem 0;
+    padding: 0.6rem 0.75rem;
+    border-radius: var(--radius-sm);
+    background: rgba(255, 200, 60, 0.08);
+    border: 1px solid rgba(255, 200, 60, 0.25);
+    color: var(--text-secondary);
+    font-size: 0.82rem;
+    line-height: 1.5;
+  }
+  .caveat code { background: var(--bg-elevated); padding: 1px 5px; border-radius: 3px; }
+  .snippet {
+    margin: 0.4rem 0;
+    padding: 0.55rem 0.7rem;
+    background: var(--bg-elevated);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    font-family: var(--font-mono);
+    font-size: 0.74rem;
+    overflow-x: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.45;
+  }
+  .copy-btn { margin: 0.2rem 0 0.4rem; }
+  .big-steps { padding-left: 1.4rem; line-height: 1.5; counter-reset: step; }
+  .big-steps > li {
+    margin-bottom: 1rem;
+    padding-left: 0.4rem;
+  }
+  .big-steps > li::marker { font-weight: 700; color: var(--accent-text); }
+  .step-title { font-weight: 600; color: var(--text); margin-bottom: 0.25rem; font-size: 0.95rem; }
+  .step-body { color: var(--text-secondary); font-size: 0.86rem; line-height: 1.55; }
+  .step-body code { background: var(--bg-elevated); padding: 1px 5px; border-radius: 3px; font-size: 0.92em; }
+  .step-body a { color: var(--accent-text); }
+  .step-note { margin: 0.5rem 0 0; font-size: 0.8rem; color: var(--text-muted); line-height: 1.5; }
+  .inline-chip { display: inline-block; vertical-align: middle; margin: 0 0.15rem; }
+  .legacy {
+    margin: 0.6rem 0 1rem;
+    padding: 0.65rem 0.85rem;
+    border: 1px dashed var(--line);
+    border-radius: var(--radius-sm);
+    background: color-mix(in srgb, var(--bg-elevated) 50%, transparent);
+  }
+  .legacy summary { cursor: pointer; font-size: 0.84rem; color: var(--text-secondary); }
+  .legacy summary code { background: var(--bg-elevated); padding: 1px 5px; border-radius: 3px; }
+  .legacy[open] summary { margin-bottom: 0.5rem; }
 
   .field { display: block; margin-top: 0.6rem; }
   .label-text { display: block; font-size: 0.7rem; letter-spacing: 0.12em; color: var(--text-muted); margin-bottom: 0.3rem; text-transform: uppercase; }

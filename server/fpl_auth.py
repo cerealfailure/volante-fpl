@@ -26,16 +26,31 @@ FULCRUM_DIR = Path(os.environ.get("FULCRUM_HOME", Path.home() / ".fulcrum"))
 COOKIE_FILE = FULCRUM_DIR / "fpl_session.json"
 AUDIT_LOG = FULCRUM_DIR / "fpl-reads.log"
 
-# Cookie landscape (as of April 2026, cross-checked with docs/research/fpl-auth-2026.md):
-#   pl_profile   — session JWT on .premierleague.com (parent scope). Required.
-#   sessionid    — Django session on fantasy.premierleague.com. Required for
-#                  /my-team/ in practice; missing it causes intermittent 403s.
-#   datadome     — DataDome anti-bot token, set since 2024. Include when present
-#                  to avoid bot-challenge 403s.
-#   csrftoken    — Only needed for write endpoints (Phase 2). Accepted now so a
-#                  full header paste doesn't lose it.
-ALLOWED_COOKIE_KEYS = {"pl_profile", "sessionid", "datadome", "csrftoken"}
-REQUIRED_FOR_READS = "pl_profile"
+# Cookie landscape (verified in Chrome April 2026 against a live FPL session):
+#   access_token  — PingOne SSO JWT on .premierleague.com. Issued by the new
+#                   OAuth/PKCE flow (account.premierleague.com). The current
+#                   credential for any account that's logged in via PingOne.
+#                   Accepted by the FPL API both as a Cookie and as
+#                   Authorization: Bearer.
+#   refresh_token — PingOne refresh token on .premierleague.com. Stored so a
+#                   future version can refresh access_token without re-paste.
+#                   Not used for reads today.
+#   pl_profile    — Legacy session JWT on .premierleague.com. Pre-PingOne accounts
+#                   may still have one; FPL accepts it for now.
+#   sessionid     — Legacy Django session on fantasy.premierleague.com. Pairs
+#                   with pl_profile on legacy accounts.
+#   datadome      — DataDome anti-bot token. Include when present to avoid
+#                   bot-challenge 403s.
+#   csrftoken     — Only needed for write endpoints (Phase 2). Accepted now so a
+#                   full header paste doesn't lose it.
+ALLOWED_COOKIE_KEYS = {
+    "access_token", "refresh_token", "global_sso_id",
+    "pl_profile", "sessionid",
+    "datadome", "csrftoken",
+}
+# Either of these proves the user is logged in. access_token is the modern flow;
+# pl_profile is the legacy flow. At least one must be present to save.
+CREDENTIAL_KEYS = ("access_token", "pl_profile")
 
 
 # ── Storage ──────────────────────────────────────────────────────────
@@ -64,16 +79,17 @@ def _atomic_write_secret(path: Path, content: str) -> None:
 def parse_cookie_input(raw: str) -> dict[str, str]:
     """
     Accept either:
-      - a full cookie header: "pl_profile=abc; csrftoken=def"
-      - just the pl_profile value on its own line
+      - a full cookie header: "access_token=...; refresh_token=...; datadome=..."
+      - the legacy form: "pl_profile=abc; csrftoken=def"
+      - just a bare credential value on its own line. Treated as access_token
+        (modern flow); use the full-header form to paste a legacy pl_profile.
     Returns {cookie_name: value} filtered to ALLOWED_COOKIE_KEYS.
     """
     if not raw or not raw.strip():
         return {}
     raw = raw.strip()
-    # Heuristic: if no '=' present, treat as a bare pl_profile value
     if "=" not in raw:
-        return {"pl_profile": raw}
+        return {"access_token": raw}
     parts: dict[str, str] = {}
     for chunk in raw.replace("\n", ";").split(";"):
         chunk = chunk.strip()
@@ -87,10 +103,17 @@ def parse_cookie_input(raw: str) -> dict[str, str]:
     return parts
 
 
+def has_credential(cookies: dict[str, str]) -> bool:
+    """True if cookies contain at least one credential we can authenticate with."""
+    return any(cookies.get(k) for k in CREDENTIAL_KEYS)
+
+
 def save_cookies(cookies: dict[str, str], account_id: int | None = None) -> None:
     clean = {k: v for k, v in cookies.items() if k in ALLOWED_COOKIE_KEYS and v}
-    if REQUIRED_FOR_READS not in clean:
-        raise ValueError(f"missing required cookie: {REQUIRED_FOR_READS}")
+    if not has_credential(clean):
+        raise ValueError(
+            f"missing required credential: need one of {CREDENTIAL_KEYS}"
+        )
     now = datetime.now(timezone.utc).isoformat()
     payload = {
         "cookies": clean,
@@ -117,7 +140,7 @@ def get_cookie_jar() -> dict[str, str] | None:
     if not data:
         return None
     cookies = (data.get("cookies") or {}) if isinstance(data.get("cookies"), dict) else {}
-    if not cookies.get(REQUIRED_FOR_READS):
+    if not has_credential(cookies):
         return None
     return {k: v for k, v in cookies.items() if k in ALLOWED_COOKIE_KEYS}
 
@@ -144,9 +167,17 @@ def mark_validated(account_id: int) -> None:
 def get_status() -> dict[str, Any]:
     data = load_cookies() or {}
     cookies = data.get("cookies") or {}
+    if cookies.get("access_token"):
+        auth_mode = "pingone"
+    elif cookies.get("pl_profile"):
+        auth_mode = "legacy"
+    else:
+        auth_mode = None
     return {
-        "connected": bool(cookies.get(REQUIRED_FOR_READS)),
+        "connected": has_credential(cookies),
+        "auth_mode": auth_mode,
         "has_csrf": bool(cookies.get("csrftoken")),
+        "has_datadome": bool(cookies.get("datadome")),
         "account_id": data.get("account_id"),
         "stored_at": data.get("stored_at"),
         "last_validated_at": data.get("last_validated_at"),
