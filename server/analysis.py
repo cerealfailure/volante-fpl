@@ -15,6 +15,7 @@ factors. The covariance matrix captures this shared fate.
 import numpy as np
 from collections import Counter, defaultdict
 import db
+import fpl
 import projections
 
 # ── Position labels ──────────────────────────────────────────────────
@@ -672,26 +673,10 @@ async def compute_correlation_attribution(
         if not squad:
             raise ValueError(f"No squad found for manager {manager_id} GW{event}")
 
+        # Current XV is used only for forward-looking exposure metrics
+        # (the variance / hinge / ENB callouts at the top of the panel).
         starters = [s for s in squad if s["squad_position"] <= 11]
         starter_ids = [s["player_id"] for s in starters]
-        histories = {}
-        started_points = {}
-        all_events = set()
-
-        for starter in starters:
-            history_rows = await db.get_player_history(database, starter["player_id"])
-            row_map = {row["event"]: row for row in history_rows}
-            histories[starter["player_id"]] = row_map
-            started_points[starter["player_id"]] = {
-                row["event"]: row["total_points"]
-                for row in history_rows
-                if row.get("minutes", 0) >= 60
-            }
-            all_events.update(row_map.keys())
-
-        selected_events = sorted(all_events)
-        if lookback is not None and lookback > 0:
-            selected_events = selected_events[-lookback:]
 
         emp_cov, gws_used = await compute_empirical_covariance(starter_ids, database, lookback=lookback)
         struct_cov = await compute_structural_covariance(starter_ids, database)
@@ -700,17 +685,46 @@ async def compute_correlation_attribution(
         captain_idx = next((i for i, s in enumerate(starters) if s["is_captain"]), None)
         exposure = compute_exposure_metrics(starter_ids, starters, cov_matrix, captain_idx)
 
+        # Pick the lookback window. Use up to `lookback` recent finished GWs.
+        max_event = event - 1 if event > 0 else event  # current GW may be in-progress
+        window_size = lookback if (lookback is not None and lookback > 0) else 5
+        window_events = list(range(max(1, max_event - window_size + 1), max_event + 1))
+
+        # Make sure we have the squad the user actually fielded each historical
+        # GW. Without this the loop would attribute current Šeško/Thiago to
+        # weeks the user didn't own them.
+        await fpl.ensure_historical_picks(database, manager_id, window_events)
+
         weeks = []
         stack_rollups = defaultdict(lambda: {"weeks": 0, "boom": 0, "bust": 0, "def_paid": 0, "def_bust": 0})
-        current_captain = next((starter for starter in starters if starter["is_captain"]), starters[0] if starters else None)
 
-        for gw in reversed(selected_events):
+        # Per-GW history rows, lazily cached so we don't re-fetch for the same
+        # player across multiple gameweeks.
+        history_cache: dict[int, dict] = {}
+
+        async def _hist_row(player_id: int, gw: int) -> dict | None:
+            rows = history_cache.get(player_id)
+            if rows is None:
+                raw = await db.get_player_history(database, player_id)
+                rows = {r["event"]: r for r in raw}
+                history_cache[player_id] = rows
+            return rows.get(gw)
+
+        for gw in reversed(window_events):
+            gw_squad = await db.get_manager_squad(database, manager_id, gw)
+            if not gw_squad:
+                # ensure_historical_picks couldn't get this GW (404, postponed,
+                # pre-season, ...). Skip cleanly so the panel doesn't lie.
+                continue
+            gw_starters = [s for s in gw_squad if s["squad_position"] <= 11]
+            gw_captain = next((s for s in gw_starters if s["is_captain"]), gw_starters[0] if gw_starters else None)
+
             total_points = 0
             team_groups = defaultdict(list)
             position_breakdown = {pos: {"total": 0} for pos in POS_NAMES.values()}
 
-            for starter in starters:
-                row = histories[starter["player_id"]].get(gw)
+            for starter in gw_starters:
+                row = await _hist_row(starter["player_id"], gw)
                 raw_points = row["total_points"] if row else 0
                 multiplier = 2 if starter["is_captain"] else 1
                 weighted_points = raw_points * multiplier
@@ -754,14 +768,34 @@ async def compute_correlation_attribution(
                     elif any((item["row"].get("minutes") or 0) > 0 for item in defenders):
                         stack_rollups[team_short]["def_bust"] += 1
 
+            captain_pts = 0
+            if gw_captain:
+                cap_row = await _hist_row(gw_captain["player_id"], gw)
+                captain_pts = (cap_row or {}).get("total_points", 0)
+
             weeks.append({
                 "event": gw,
                 "total_points": total_points,
-                "captain_name": current_captain["web_name"] if current_captain else "",
-                "captain_pts": histories.get(current_captain["player_id"], {}).get(gw, {}).get("total_points", 0) if current_captain else 0,
+                "captain_name": gw_captain["web_name"] if gw_captain else "",
+                "captain_pts": captain_pts,
                 "team_stacks": sorted(team_stacks, key=lambda stack: (-stack["count"], -stack["total_pts"], stack["team_short"])),
                 "position_breakdown": position_breakdown,
             })
+
+        # Used by patterns / cluster sections downstream.
+        selected_events = window_events
+
+        # Pre-load started-only history for the current XV. This drives the
+        # pair-correlation explanations at the bottom of the panel (which are
+        # about the present squad's relationships, not historical attribution).
+        started_points: dict[int, dict[int, int]] = {}
+        for s in starters:
+            raw = await db.get_player_history(database, s["player_id"])
+            started_points[s["player_id"]] = {
+                r["event"]: r["total_points"]
+                for r in raw
+                if r.get("minutes", 0) >= 60
+            }
 
         patterns = []
         total_weeks = len(selected_events)

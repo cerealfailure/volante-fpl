@@ -246,6 +246,39 @@ async def sync_player_histories(player_ids: list[int]) -> dict:
         await conn.close()
 
 
+async def ensure_historical_picks(conn, manager_id: int, events: list[int]) -> set[int]:
+    """
+    Make sure manager_picks rows exist for each (manager_id, event) pair.
+    Missing events are fetched from FPL's public picks endpoint and cached.
+    Returns the set of events that were successfully covered.
+    """
+    if not events:
+        return set()
+    rows = await conn.execute_fetchall(
+        f"""SELECT DISTINCT event FROM manager_picks
+            WHERE manager_id=? AND event IN ({','.join('?' * len(events))})""",
+        [manager_id, *events],
+    )
+    have = {r["event"] for r in rows}
+    missing = [ev for ev in events if ev not in have]
+    if not missing:
+        return have
+    async with _session() as session:
+        for ev in missing:
+            try:
+                data = await fetch_manager_picks(session, manager_id, ev)
+                picks = data.get("picks") or []
+                if picks:
+                    await db.upsert_manager_picks(conn, manager_id, ev, picks)
+                    have.add(ev)
+            except FplError:
+                # Fixture postponements / pre-season / new entries can 404.
+                # Skip silently — the caller falls back to whatever we have.
+                continue
+    await conn.commit()
+    return have
+
+
 async def _enrich_transfer_eps(conn, transfers: list[dict]) -> list[dict]:
     """
     Annotate each transfer with forecast EP (from players.ep_next at sync time)
