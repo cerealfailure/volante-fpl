@@ -1,5 +1,15 @@
 <script lang="ts">
-  import { getAttribution, getFixtureExposure, getPlayerDetail, getXray, getXrayForecast, getXrayWithLookback } from '$lib/api';
+  import { onMount } from 'svelte';
+  import {
+    getAttribution,
+    getFixtureExposure,
+    getFplStatus,
+    getPlayerDetail,
+    getXray,
+    getXrayForecast,
+    getXrayWithLookback,
+    type FplSessionStatus,
+  } from '$lib/api';
   import { managerId, recentManagers, rememberManager, forgetManager } from '$lib/session';
   import { gaffer } from '$lib/coach';
   import CorrelationDeepDive from '$lib/components/CorrelationDeepDive.svelte';
@@ -39,6 +49,11 @@
   // fixture exposure
   let exposure: any = $state(null);
   let expLoading = $state(false);
+  let fplStatus = $state<FplSessionStatus | null>(null);
+  let fplStatusLoading = $state(true);
+  let authBootstrapping = $state(true);
+  let livePromptedManagerId = $state<number | null>(null);
+  let showPublicFallback = $state(false);
 
   // section tabs for analysis area
   let analysisTab: 'week' | 'portfolio' | 'issues' | 'deep' = $state('portfolio');
@@ -62,42 +77,106 @@
   // collapsible issues
   let showIssues = $state(false);
 
-  // auto-load if session exists
-  $effect(() => {
-    if ($managerId && !data && !loading) {
-      loading = true;
-      getXray($managerId)
-        .then(d => { data = d; loadFixtureExposure(); })
-        .catch(e => { error = e.message; managerId.set(null); })
-        .finally(() => { loading = false; });
-    }
+  onMount(() => {
+    void bootstrapAuth();
   });
 
-  async function loadFixtureExposure() {
-    if (!$managerId) return;
+  async function refreshFplStatus() {
+    fplStatusLoading = true;
+    try {
+      fplStatus = await getFplStatus();
+    } catch {
+      fplStatus = null;
+    } finally {
+      fplStatusLoading = false;
+    }
+  }
+
+  async function bootstrapAuth() {
+    authBootstrapping = true;
+    await refreshFplStatus();
+    const connectedId = fplStatus?.connected ? fplStatus.account_id : null;
+    if (connectedId) {
+      await loadManager(connectedId);
+    } else {
+      managerId.set(null);
+      data = null;
+      exposure = null;
+      error = '';
+    }
+    authBootstrapping = false;
+  }
+
+  async function loadFixtureExposure(managerIdOverride?: number) {
+    const activeId = managerIdOverride ?? $managerId;
+    if (!activeId) return;
     expLoading = true;
-    try { exposure = await getFixtureExposure($managerId); } catch {}
+    try { exposure = await getFixtureExposure(activeId); } catch {}
     finally { expLoading = false; }
+  }
+
+  function rememberLoadedManager(id: number, snapshot: any) {
+    rememberManager({
+      id,
+      team_name: snapshot?.manager?.name ?? 'My Team',
+      player_name: snapshot?.manager?.player_name ?? '',
+      last_used: new Date().toISOString(),
+    });
+  }
+
+  async function loadManager(id: number) {
+    if (!id || id < 1) {
+      error = 'Enter a valid FPL manager ID';
+      return;
+    }
+    loading = true;
+    error = '';
+    data = null;
+    exposure = null;
+    selectedPlayer = null;
+    playerDetail = null;
+    try {
+      const snapshot = await getXray(id);
+      data = snapshot;
+      managerId.set(id);
+      rememberLoadedManager(id, snapshot);
+      await loadFixtureExposure(id);
+    } catch (e: any) {
+      error = e.message || 'Failed to sign in';
+      data = null;
+      exposure = null;
+      managerId.set(null);
+    } finally { loading = false; }
   }
 
   async function login(idOverride?: number) {
     const id = idOverride ?? parseInt(idInput);
-    if (!id || id < 1) { error = 'Enter a valid FPL manager ID'; return; }
-    loading = true; error = '';
-    try {
-      data = await getXray(id);
-      managerId.set(id);
-      rememberManager({
-        id,
-        team_name: data?.manager?.name ?? 'My Team',
-        player_name: data?.manager?.player_name ?? '',
-        last_used: new Date().toISOString(),
-      });
-      loadFixtureExposure();
-    } catch (e: any) {
-      error = e.message || 'Failed to sign in'; data = null;
-    } finally { loading = false; }
+    await loadManager(id);
   }
+
+  function loginConnectedManager() {
+    if (fplStatus?.account_id) login(fplStatus.account_id);
+  }
+
+  let liveSessionState = $derived.by(() => {
+    const activeManagerId = data?.manager?.id ?? $managerId;
+    if (!fplStatus?.connected) return 'missing';
+    if (activeManagerId && fplStatus.account_id && fplStatus.account_id !== activeManagerId) return 'mismatch';
+    return 'connected';
+  });
+
+  $effect(() => {
+    const activeManagerId = data?.manager?.id ?? $managerId;
+    if (!activeManagerId || fplStatusLoading || livePromptedManagerId === activeManagerId) return;
+    livePromptedManagerId = activeManagerId;
+    if (!fplStatus?.connected) {
+      gaffer.say('LIVE FPL OFF. OPEN SETTINGS AND PASTE pl_profile + sessionid FOR LIVE BANK AND FT.');
+      return;
+    }
+    if (fplStatus.account_id && fplStatus.account_id !== activeManagerId) {
+      gaffer.say(`LIVE COOKIE BELONGS TO #${fplStatus.account_id}. RE-PASTE IT OR SWITCH MANAGERS.`);
+    }
+  });
 
   async function selectPlayer(p: any) {
     if (selectedPlayer?.id === p.id) { selectedPlayer = null; playerDetail = null; return; }
@@ -343,8 +422,12 @@
 </script>
 
 <div class="container page-stack" class:reveal={!!data}>
-  {#if !$managerId && !data}
-    <!-- Sign-in screen -->
+  {#if authBootstrapping && !data}
+    <div class="loading-state">
+      <div class="spinner"></div>
+      <p class="dim">Checking live FPL session…</p>
+    </div>
+  {:else if !$managerId && !data}
     <section class="signin reveal">
       <div class="signin-crest" style="--i:0">
         <img src="/logo.svg" alt="Volante" class="crest clean-only" width="80" height="80" />
@@ -352,63 +435,137 @@
       </div>
 
       <span class="eyebrow" style="--i:1"><Icon.Ball size={12} /> FPL · PORTFOLIO · DESK</span>
-      <h1 class="display" style="--i:2">Your squad is a portfolio.<br/>Manage it like one.</h1>
+      <h1 class="display" style="--i:2">
+        {#if fplStatus?.connected && fplStatus.account_id}
+          Your live desk is ready.<br/>Open the connected squad.
+        {:else}
+          Connect your live FPL session.<br/>Then let Volante pull the squad.
+        {/if}
+      </h1>
       <span class="signin-rule" aria-hidden="true" style="--i:3"></span>
       <p class="signin-sub" style="--i:4">
-        Volante reads your FPL squad like a desk notebook:
-        where the stack sits, what drives the week, and which outcomes are too concentrated.
+        {#if fplStatus?.connected && fplStatus.account_id}
+          Volante found a saved FPL session for manager <span class="mono">#{fplStatus.account_id}</span>.
+          Open that account to keep bank, free transfers and live pre-deadline state in sync.
+        {:else}
+          Cookie-first is the clean path here. Paste <span class="mono">pl_profile</span> and <span class="mono">sessionid</span> once,
+          and the app will use your real FPL account instead of making you hunt for manager IDs.
+        {/if}
       </p>
 
-      {#if $recentManagers.length > 0}
-        <!-- Quick-resume for returning visitors -->
-        <div class="recent-managers" style="--i:5">
-          <div class="recent-head">
-            <Icon.Jersey size={12} />
-            <span>Sign in as…</span>
-          </div>
-          <div class="recent-list">
-            {#each $recentManagers as mgr}
-              <div class="recent-row">
-                <button class="recent-chip" onclick={() => login(mgr.id)} disabled={loading}>
-                  <span class="rc-name">{mgr.team_name}</span>
-                  <span class="rc-sub mono">#{mgr.id} · {mgr.player_name}</span>
-                </button>
-                <button class="recent-forget" title="Remove" onclick={() => forgetManager(mgr.id)}>×</button>
-              </div>
-            {/each}
-          </div>
-        </div>
-        <div class="or-divider"><span>or sign in with another ID</span></div>
-      {/if}
-
-      <form class="signin-form" style="--i:6" onsubmit={(e) => { e.preventDefault(); login(); }}>
-        <label class="signin-field">
-          <span class="label-text">FPL Manager ID</span>
-          <div class="field-row">
-            <input
-              type="text"
-              inputmode="numeric"
-              bind:value={idInput}
-              onkeydown={handleKey}
-              placeholder="e.g. 12345"
-              disabled={loading}
-              autocomplete="off"
-            />
-            <button class="btn-primary" type="submit" disabled={loading}>
-              {#if loading}
-                Syncing…
+      <section class="live-cookie-card" style="--i:5">
+        <div class="live-cookie-head">
+          <div>
+            <span class="label-text">Live FPL Session</span>
+            <h2>
+              {#if fplStatus?.connected}
+                Cookie connected. Use it as the primary sign-in.
               {:else}
-                Sign in <Icon.Ball size={14} />
+                Use the cookie system for live bank, FT and staged-chip state.
               {/if}
-            </button>
+            </h2>
           </div>
-        </label>
-        <p class="signin-hint">
-          <Icon.Flag size={12} />
-          <span>Find your ID at <span class="mono">fantasy.premierleague.com → Points</span> — it's in the URL.</span>
+          {#if fplStatusLoading}
+            <span class="live-chip">checking…</span>
+          {:else if fplStatus?.connected}
+            <span class="live-chip connected">connected</span>
+          {:else}
+            <span class="live-chip">not connected</span>
+          {/if}
+        </div>
+
+        <p class="live-cookie-copy">
+          Manager ID gets you the public squad view. The live cookie path upgrades that with in-progress transfer count,
+          live bank and current pre-deadline squad state.
         </p>
-        {#if error}<p class="error-msg">{error}</p>{/if}
-      </form>
+
+        {#if fplStatus?.connected && fplStatus.account_id}
+          <p class="live-cookie-note">
+            Connected as manager <span class="mono">#{fplStatus.account_id}</span>. Use that manager for live reads.
+          </p>
+        {:else}
+          <ol class="live-cookie-steps">
+            <li>Log in at <code>fantasy.premierleague.com</code>.</li>
+            <li>DevTools → <b>Application</b> → <b>Cookies</b> → copy <code>pl_profile</code> and <code>sessionid</code>.</li>
+            <li>Open <a href="/settings">Settings</a> and paste <code>pl_profile=&lt;value&gt;; sessionid=&lt;value&gt;</code>.</li>
+          </ol>
+        {/if}
+
+        <div class="live-cookie-actions">
+          {#if fplStatus?.connected && fplStatus.account_id}
+            <button class="btn-primary cookie-open-live" onclick={loginConnectedManager} disabled={loading}>
+              <Icon.Jersey size={12} />
+              Open my live team
+            </button>
+          {/if}
+          <a class="cookie-settings-link" href="/settings">
+            <Icon.Whistle size={12} />
+            {fplStatus?.connected ? 'Review live session' : 'Open live session setup'}
+          </a>
+        </div>
+      </section>
+
+      <div class="public-fallback" style="--i:6">
+        <button
+          class="public-toggle"
+          type="button"
+          aria-expanded={showPublicFallback}
+          onclick={() => showPublicFallback = !showPublicFallback}
+        >
+          <Icon.Flag size={12} />
+          {showPublicFallback ? 'Hide public manager fallback' : 'Use public manager ID instead'}
+        </button>
+
+        {#if showPublicFallback}
+          <div class="public-panel">
+            {#if $recentManagers.length > 0}
+              <div class="recent-managers">
+                <div class="recent-head">
+                  <Icon.Jersey size={12} />
+                  <span>Recent public managers</span>
+                </div>
+                <div class="recent-list">
+                  {#each $recentManagers as mgr}
+                    <div class="recent-row">
+                      <button class="recent-chip" onclick={() => login(mgr.id)} disabled={loading}>
+                        <span class="rc-name">{mgr.team_name}</span>
+                        <span class="rc-sub mono">#{mgr.id} · {mgr.player_name}</span>
+                      </button>
+                      <button class="recent-forget" title="Remove" onclick={() => forgetManager(mgr.id)}>×</button>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+
+            <form class="signin-form public-form" onsubmit={(e) => { e.preventDefault(); login(); }}>
+              <label class="signin-field">
+                <span class="label-text">Public Manager ID</span>
+                <div class="field-row">
+                  <input
+                    type="text"
+                    inputmode="numeric"
+                    bind:value={idInput}
+                    onkeydown={handleKey}
+                    placeholder="e.g. 12345"
+                    disabled={loading}
+                    autocomplete="off"
+                  />
+                  <button class="btn-ghost" type="submit" disabled={loading}>
+                    {loading ? 'Syncing…' : 'Open public team'}
+                  </button>
+                </div>
+              </label>
+              <p class="signin-hint">
+                <Icon.Flag size={12} />
+                <span>Find the ID at <span class="mono">fantasy.premierleague.com → Points</span> — it’s in the URL.</span>
+              </p>
+            </form>
+          </div>
+        {/if}
+      </div>
+
+      {#if error}<p class="error-msg">{error}</p>{/if}
 
       <button class="help-link" style="--i:7" onclick={() => showHelp = true}>
         <Icon.Whistle size={12} />
@@ -442,6 +599,31 @@
   {:else if loading && !data}
     <div class="loading-state"><div class="spinner"></div><p class="dim">Syncing squad data…</p></div>
   {:else if data}
+    {#if liveSessionState !== 'connected'}
+      <section class="live-banner fade-in" style="--i:0">
+        <div class="live-banner-copy">
+          <strong>
+            {#if liveSessionState === 'mismatch'}
+              Live cookie is connected to a different manager.
+            {:else}
+              Live cookie is not connected yet.
+            {/if}
+          </strong>
+          <span>
+            {#if liveSessionState === 'mismatch'}
+              The stored session belongs to <span class="mono">#{fplStatus?.account_id}</span>, so this manager stays on public LAST GW data until you re-paste the correct cookie.
+            {:else}
+              This manager is running on public LAST GW data. Add your FPL cookie to unlock live bank and true free-transfer count.
+            {/if}
+          </span>
+        </div>
+        <a class="live-banner-link" href="/settings">
+          <Icon.Whistle size={12} />
+          Open Settings
+        </a>
+      </section>
+    {/if}
+
     <!-- ═════ MANAGER HEADER ═════ -->
     <section class="mgr-header" style="--i:0">
       <div class="mgr-identity">
@@ -1068,7 +1250,7 @@
     font-size: 1rem;
     padding: 0.7rem 0.85rem;
   }
-  .field-row .btn-primary { padding: 0.7rem 1.1rem; }
+  .field-row button { padding: 0.7rem 1.1rem; }
 
   .signin-hint {
     display: inline-flex;
@@ -1079,6 +1261,149 @@
     margin-top: 0.2rem;
   }
   .error-msg { color: var(--red); font-size: 0.85rem; margin-top: 0.3rem; }
+
+  .live-cookie-card {
+    width: 100%;
+    max-width: 520px;
+    margin-top: 0.35rem;
+    padding: 1rem 1.05rem;
+    border: 1px solid rgba(0, 255, 156, 0.18);
+    border-radius: var(--radius-lg);
+    background:
+      linear-gradient(180deg, rgba(0, 255, 156, 0.05), transparent 65%),
+      color-mix(in srgb, var(--bg-card) 94%, transparent);
+    text-align: left;
+  }
+  .live-cookie-head {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 1rem;
+  }
+  .live-cookie-head h2 {
+    margin: 0.25rem 0 0;
+    max-width: 22ch;
+    font-size: 1.05rem;
+    line-height: 1.15;
+  }
+  .live-chip {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    padding: 0.28rem 0.6rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    font-family: var(--mono);
+    font-size: 0.64rem;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    background: rgba(255, 255, 255, 0.04);
+  }
+  .live-chip.connected {
+    color: var(--accent-text);
+    border-color: rgba(0, 255, 156, 0.24);
+    background: var(--accent-soft);
+  }
+  .live-cookie-copy,
+  .live-cookie-note {
+    margin: 0.7rem 0 0;
+    color: var(--text-secondary);
+    line-height: 1.55;
+    font-size: 0.88rem;
+  }
+  .live-cookie-note {
+    color: var(--text);
+  }
+  .live-cookie-steps {
+    margin: 0.75rem 0 0;
+    padding-left: 1.15rem;
+    color: var(--text-secondary);
+    line-height: 1.6;
+    font-size: 0.86rem;
+  }
+  .live-cookie-steps li { margin-bottom: 0.2rem; }
+  .live-cookie-steps code,
+  .live-cookie-note .mono {
+    background: var(--bg-elevated);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .live-cookie-steps a {
+    color: var(--accent);
+    text-decoration: none;
+  }
+  .live-cookie-steps a:hover { text-decoration: underline; }
+  .live-cookie-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.65rem;
+    flex-wrap: wrap;
+    margin-top: 0.9rem;
+  }
+  .cookie-open-live {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .cookie-signin,
+  .cookie-settings-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+  .cookie-settings-link {
+    color: var(--text);
+    text-decoration: none;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    padding: 0.5rem 0.9rem;
+    background: var(--bg-elevated);
+    font-size: 0.8rem;
+  }
+  .cookie-settings-link:hover {
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+
+  .public-fallback {
+    width: 100%;
+    max-width: 520px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.7rem;
+  }
+  .public-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.45rem;
+    align-self: center;
+    background: transparent;
+    border: 1px dashed var(--border);
+    color: var(--text-secondary);
+    padding: 0.5rem 0.9rem;
+    border-radius: 999px;
+    cursor: pointer;
+    font-size: 0.76rem;
+  }
+  .public-toggle:hover {
+    border-style: solid;
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
+  .public-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 0.8rem;
+    padding: 0.95rem 1rem;
+    background: color-mix(in srgb, var(--bg-card) 92%, transparent);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-lg);
+  }
+  .public-form {
+    max-width: none;
+  }
 
   .help-link {
     background: transparent;
@@ -1140,6 +1465,51 @@
     padding: 0;
   }
   .footer-help-link:hover { color: var(--accent); }
+
+  .live-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    margin-bottom: 0.9rem;
+    padding: 0.95rem 1rem;
+    border: 1px solid rgba(0, 255, 156, 0.16);
+    border-radius: var(--radius-lg);
+    background:
+      linear-gradient(90deg, rgba(0, 255, 156, 0.06), transparent 45%),
+      var(--bg-card);
+  }
+  .live-banner-copy {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+  .live-banner-copy strong {
+    font-family: var(--heading);
+    font-size: 0.98rem;
+    color: var(--text-heading);
+  }
+  .live-banner-copy span {
+    color: var(--text-secondary);
+    line-height: 1.5;
+    font-size: 0.85rem;
+  }
+  .live-banner-link {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: var(--text);
+    text-decoration: none;
+    padding: 0.55rem 0.9rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--bg-elevated);
+  }
+  .live-banner-link:hover {
+    border-color: var(--accent);
+    color: var(--accent-text);
+  }
 
   .loading-state {
     display: flex;
@@ -1704,6 +2074,11 @@
     .grid-main { grid-template-columns: 1fr; }
     .scoreboard { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     .signin-feats { grid-template-columns: 1fr; }
+    .live-cookie-head,
+    .live-banner {
+      flex-direction: column;
+      align-items: stretch;
+    }
     .signin h1 { font-size: 2rem; }
     .mgr-identity h1 { font-size: 2rem; }
     .xi-sparkline { min-width: 0; }

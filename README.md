@@ -2,6 +2,32 @@
 
 Volante FPL is an FPL squad-analysis app with a FastAPI backend and Svelte frontend.
 
+## Upgrade Now
+
+**Recommended branch:** `fpl-cookie-first-20260415`
+
+If you are on an older manager-ID-first build, move to this branch. It makes the app cookie-first:
+
+- auto-opens the connected FPL account when a valid live session exists
+- keeps live bank / free transfers / staged squad state aligned with the real account
+- demotes manual manager ID entry to a fallback path instead of the main sign-in flow
+
+Switch with:
+
+```bash
+git fetch origin
+git switch fpl-cookie-first-20260415
+./scripts/install-volante-launchd.sh
+```
+
+If `git switch` says the branch does not exist locally yet:
+
+```bash
+git fetch origin
+git switch -c fpl-cookie-first-20260415 --track origin/fpl-cookie-first-20260415
+./scripts/install-volante-launchd.sh
+```
+
 The repo is now split into two modes:
 
 - `fpl_only`: default, safe to clone and run from GitHub, no private intel HTTP surface

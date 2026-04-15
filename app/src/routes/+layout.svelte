@@ -2,6 +2,8 @@
   import '../styles/base.css';
   import '../styles/themes/clean.css';
   import '../styles/themes/pixel.css';
+  import { onMount } from 'svelte';
+  import { getFplStatus } from '$lib/api';
   import { managerId } from '$lib/session';
   import { page } from '$app/stores';
   import { onNavigate } from '$app/navigation';
@@ -25,9 +27,17 @@
     });
   });
 
-  function logout() {
-    managerId.set(null);
-    window.location.href = '/';
+  onMount(() => {
+    void bootstrapManagerFromCookie();
+  });
+
+  async function bootstrapManagerFromCookie() {
+    try {
+      const status = await getFplStatus();
+      if (status.connected && status.account_id && status.account_id !== $managerId) {
+        managerId.set(status.account_id);
+      }
+    } catch {}
   }
 
   type NavItem = {
@@ -92,10 +102,10 @@
 
       <div class="header-right">
         {#if $managerId}
-          <button class="id-chip" onclick={logout} title="Log out">
+          <span class="id-chip" title="Connected manager">
             <Icon.Jersey size={14} />
             <span class="mono">#{$managerId}</span>
-          </button>
+          </span>
         {:else}
           <span class="dim2 small tagline">
             <Icon.Ball size={14} />
@@ -292,11 +302,6 @@
     color: var(--text-secondary);
     font-size: 0.78rem;
     border-radius: var(--radius);
-    cursor: pointer;
-  }
-  .id-chip:hover {
-    border-color: var(--accent);
-    color: var(--accent-text);
   }
   .tagline {
     display: inline-flex;
